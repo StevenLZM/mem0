@@ -906,3 +906,162 @@ stateDiagram-v2
 1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及 `_entity_store is None` 分支。
 2. **设计决策题：** 为“删除某用户全部偏好”设计分页直到空、计数验证、entity/history/backup 策略，并定义部分失败时是否返回成功。
 3. **面试题：** `delete_all()` 与 `reset()` 为何分开？ADD-only 与 supersede 如何处理冲突？
+
+## 9. 从零实现一个最小记忆系统 {#chapter-9}
+
+`examples/memory_system_design_demo.py` 是标准库教学引擎；V0–V4 逐步增加不变量。
+
+### 9.1 V0：保存全部消息
+
+**数据模型变化。** V0 只有 `list[str]`：每条消息原样追加，没有 ID、作用域或派生字段。
+
+**教学实现**
+```python
+messages_v0: list[str] = []
+
+
+def remember_v0(message: str) -> None:
+    messages_v0.append(message)
+```
+
+**解决的问题。** 保存消息。
+
+**剩余失败。** 线性增长、重复、串线、全表扫描。
+
+**Mem0 对应符号。** 近似 `Memory.add(..., infer=False)` 与 recent messages，尚非 `MemoryItem`。
+
+### 9.2 V1：抽取原子事实
+
+**数据模型变化。** 输入变为 `MemoryInput`，存储变为带 `id`、`content_hash` 的 `MemoryRecord`；整段问答先拆成独立事实。
+
+**教学实现**
+```python
+def remember_v1(engine: MemoryEngine, facts: list[str], scope: Scope) -> list[str]:
+    return [engine.add(MemoryInput(text=fact), scope).id for fact in facts]
+```
+
+demo **没有** LLM 抽取器，`facts` 由调用者给出。`add()` 对小写、折叠空白的正文算 MD5；scope 与 hash 都相同时复用记录。这不是语义去重；同义改写仍新增，MD5 也不用于权限。
+
+**解决的问题。** 事实可独立去重和检索。
+
+**剩余失败。** 抽取、否定、归因、冲突由上游决定。
+
+**Mem0 对应符号。** `Memory.add()`、V3 extraction prompt、`_add_to_vector_store()`、`_create_memory()` 的 payload `data`/`hash`；自动推断为 ADD-only，不会自动 UPDATE/DELETE。
+
+### 9.3 V2：作用域、Embedding 与语义检索
+
+**数据模型变化。** 记录增加 `Scope(user_id, agent_id, run_id)`、`vector`、`keywords` 与时间；至少一个 scope ID 必填。
+
+**教学实现**
+```python
+scope = Scope(user_id="alice")
+engine = MemoryEngine(embedder=DeterministicEmbedder(dimensions=64))
+engine.add(MemoryInput("User prefers Python examples"), scope)
+hits = engine.search("Python examples", scope, threshold=0.10, top_k=5)
+```
+
+`Scope.contains()` 要求查询中非 `None` 的字段与记录相等；`None` 是通配。它不代替外层鉴权。
+
+`DeterministicEmbedder` 把 token 的 SHA-256 映射到固定桶并归一化。它只是**确定性词法教学模型**：共享 token 才易相似，碰撞会造假；没有真正语义能力。search 先算 cosine，低于 threshold 便淘汰。
+
+**解决的问题。** scope 隔离、top-k、重复实验。
+
+**剩余失败。** 同义词、中文分词、跨语言、碰撞和阈值校准未解决。
+
+**Mem0 对应符号。** `Memory.search()` filters、`_search_vector_store()`、`embedding_model.embed()`、Vector Store `search()`；`Scope.contains()` 只是 filters 的内存简化版。
+
+### 9.4 V3：关键词、实体与融合评分
+
+**数据模型变化。** 记录增加 `keywords`、`entities`；结果变为 `SearchHit`，`ScoreDetails` 暴露各路分数。
+
+**教学实现**
+```python
+hits = engine.search(
+    "Which vector database does Mem0 use? Qdrant",
+    Scope(user_id="alice"),
+    query_entities=("Mem0", "Qdrant"),
+    threshold=0.10,
+    explain=True,
+)
+```
+
+关键词分是 `|query ∩ record| / |query|`，非 BM25；实体交集加 `0.5`。最终分为 `(semantic + keyword + entity) / max_possible`，分母由查询激活信号决定；按 `(-score, id)` 排序，explain 暴露明细。
+
+**解决的问题。** 精确词、实体改善排序。
+
+**剩余失败。** regex 集合忽略词频、长度和语言学，实体由调用者提供；阈值仍先门控语义候选，所以不是真正多路召回。
+
+**Mem0 对应符号。** `lemmatize_for_bm25()`、`keyword_search()`、`_compute_entity_boosts()`、`normalize_bm25()`、`score_and_rank()`；demo 只复刻融合形状。
+
+### 9.5 V4：历史、更新、过期与冲突
+
+**数据模型变化。** 记录增加三个时间字段；`MemoryEngine.events: list[HistoryEvent]` 追加 ADD/UPDATE/DELETE 的 old/new。冲突须由应用确认后 update 或并存。
+
+**教学实现**
+```python
+record = engine.add(MemoryInput("Project uses Redis"), Scope(user_id="alice"))
+engine.update(record.id, text="Project uses pgvector", entities=("pgvector",))
+audit_trail = engine.history(record.id)
+engine.delete(record.id)
+```
+
+update 保留 `id`/`created_at`，重算向量、关键词、hash 并写 old/new；delete 移除主记录、保留 DELETE history。search 跳过 `expires_at < now`，无后台 TTL；hash 不识别冲突。
+
+**解决的问题。** 支持过期与纠错。
+
+**剩余失败。** 重启即丢；记录与事件无事务，也无版本、并发控制、级联删除或法规级擦除。
+
+**Mem0 对应符号。** `Memory.update()`/`delete()`/`history()`、payload `expiration_date`、SQLite `history` 表及 `add_history()`/`get_history()`。OSS 是 UTC 日期粒度，demo 是 `datetime`。
+
+### 9.6 教学实现与 Mem0 的符号对照
+
+| 教学符号 | 教学职责 | Mem0 当前对应 | 不能等同之处 |
+|---|---|---|---|
+| `Scope` / `contains()` | user/agent/run 隔离 | Mem0 filters、`_build_filters_and_metadata()` | Provider 过滤更丰富；授权在应用层 |
+| `MemoryRecord` | 正文、向量、hash、scope、时间 | Vector payload / `MemoryItem` | `MemoryItem` 无向量，schema 不等同 |
+| `MemoryEngine.events` | ADD/UPDATE/DELETE 日志 | `SQLiteManager.history`、`add_history()`/`get_history()` | 与主存无共享事务，非合规账本 |
+| 教学 scoring | cosine、词、实体、归一化 | `score_and_rank()` | Mem0 使用 semantic candidates、BM25 和实体索引分数 |
+
+crosswalk 只映射职责。生产仍缺：LLM 抽取质量控制；健壮 tokenizer/BM25；持久化存储；事务/补偿；并发/幂等；Provider 失败降级；离线评测与监控。
+
+### 9.7 运行确定性演示
+
+从仓库根目录运行；默认 embedder 不联网，输出各路分数。
+
+**教学实现**
+```bash
+conda run -n mem0 python examples/memory_system_design_demo.py
+```
+
+测试命令是 `conda run -n mem0 python -m pytest tests/examples/test_memory_system_design_demo.py -q`；它验证教学不变量，不代表生产质量。
+
+### 9.8 可选实验：替换为 DeepSeek 与 Qdrant
+
+这是**可选实验**。先启动 Qdrant 并安装依赖；DeepSeek 密钥只读环境变量，绝不提交。
+
+**教学实现**
+```python
+import os
+
+from mem0 import Memory
+
+config = {
+    "llm": {"provider": "deepseek", "config": {
+        "model": "deepseek-chat", "api_key": os.environ["DEEPSEEK_API_KEY"]}},
+    "embedder": {"provider": "huggingface", "config": {
+        "model": "multi-qa-MiniLM-L6-cos-v1"}},
+    "vector_store": {"provider": "qdrant", "config": {
+        "host": "localhost", "port": 6333, "embedding_model_dims": 384,
+        "collection_name": "memory_tutorial"}},
+}
+memory = Memory.from_config(config)
+```
+
+固定输入、scope、top-k，记录抽取、延迟与漏召回。真实模型不能与词法分数横比；Provider 仍会失败。
+
+### 9.9 本章练习与面试思考
+
+1. **代码阅读题：** 标出 scope、过期、threshold 顺序，解释为何不能救回候选。
+2. **实现题：** 增加 `idempotency_key`，写出并发 add 的不变量。
+3. **设计决策题：** 合并 semantic/BM25 候选，并处理主存成功、history 失败。
+4. **面试题：** 为何确定性 embedder 不能证明语义能力？如何用 Recall@k、MRR 评测？
