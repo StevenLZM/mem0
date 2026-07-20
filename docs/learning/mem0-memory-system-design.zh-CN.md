@@ -913,7 +913,15 @@ stateDiagram-v2
 
 ### 9.1 V0：保存全部消息
 
-**数据模型变化。** V0 只有 `list[str]`：每条消息原样追加，没有 ID、作用域或派生字段。
+**直觉。** 先让系统记住，再讨论记得是否正确。
+
+**模型（数据模型变化）。** V0 只有 `list[str]`，没有 ID、作用域或派生字段。
+
+**候选方案。** 可保存全文、固定窗口或摘要；前两者可逆，摘要会丢证据。
+
+**选择。** 追加全部消息作为基线。**解决的问题：**下一轮能读取旧消息。
+
+**数据流。** `message → append → list`；读取时只能遍历全部内容。
 
 **教学实现**
 ```python
@@ -924,15 +932,21 @@ def remember_v0(message: str) -> None:
     messages_v0.append(message)
 ```
 
-**解决的问题。** 保存消息。
+**Mem0 源码对照。** V0 没有一一对应物。`Memory.add(..., infer=False)` 会将每条非 system 原始消息 embed 后经 `_create_memory()` 写为 vector memory，并直接返回；这个 early return **不调用** `SQLiteManager.save_messages()`。recent messages 只在 infer 管线维护，是供抽取使用的短窗口上下文。两者都保留原始消息，除此之外不是同一路径。
 
-**剩余失败。** 线性增长、重复、串线、全表扫描。
-
-**Mem0 对应符号。** 近似 `Memory.add(..., infer=False)` 与 recent messages，尚非 `MemoryItem`。
+**取舍。** 实现最透明；**剩余失败：**线性增长、重复、串线和全表扫描。
 
 ### 9.2 V1：抽取原子事实
 
-**数据模型变化。** 输入变为 `MemoryInput`，存储变为带 `id`、`content_hash` 的 `MemoryRecord`；整段问答先拆成独立事实。
+**直觉。** 长期有用的是“偏好 Python”，不是产生它的整段寒暄。
+
+**模型（数据模型变化）。** 输入变为 `MemoryInput`，存储变为带 `id`、`content_hash` 的 `MemoryRecord`。
+
+**候选方案。** 原文最完整，摘要更短，原子事实最适合独立检索与更新。
+
+**选择。** 调用者先给出事实，再逐条写入。**解决的问题：**事实可独立去重和检索。
+
+**数据流。** `facts → MemoryInput → normalize → MD5 → MemoryRecord`；scope 与 hash 都相同时复用记录。
 
 **教学实现**
 ```python
@@ -940,17 +954,21 @@ def remember_v1(engine: MemoryEngine, facts: list[str], scope: Scope) -> list[st
     return [engine.add(MemoryInput(text=fact), scope).id for fact in facts]
 ```
 
-demo **没有** LLM 抽取器，`facts` 由调用者给出。`add()` 对小写、折叠空白的正文算 MD5；scope 与 hash 都相同时复用记录。这不是语义去重；同义改写仍新增，MD5 也不用于权限。
+**Mem0 源码对照。** 对应 `Memory.add()`、V3 extraction prompt、`_add_to_vector_store()`、`_create_memory()` 的 payload `data`/`hash`。自动推断是 ADD-only；demo 自身没有 LLM 抽取器，`facts` 由调用者提供。
 
-**解决的问题。** 事实可独立去重和检索。
-
-**剩余失败。** 抽取、否定、归因、冲突由上游决定。
-
-**Mem0 对应符号。** `Memory.add()`、V3 extraction prompt、`_add_to_vector_store()`、`_create_memory()` 的 payload `data`/`hash`；自动推断为 ADD-only，不会自动 UPDATE/DELETE。
+**取舍。** MD5 仅做规范化文本的 scope 内精确去重，不是语义去重或权限机制；**剩余失败：**同义改写、否定、归因和冲突仍由上游处理。
 
 ### 9.3 V2：作用域、Embedding 与语义检索
 
-**数据模型变化。** 记录增加 `Scope(user_id, agent_id, run_id)`、`vector`、`keywords` 与时间；至少一个 scope ID 必填。
+**直觉。** 事实变短后仍需先隔离所有者，再按查询相关性找回。
+
+**模型（数据模型变化）。** 记录增加 `Scope(user_id, agent_id, run_id)`、`vector`、`keywords` 与时间；至少一个 scope ID 必填。
+
+**候选方案。** 精确匹配简单但漏同义表达，真实 Embedding 较强但引入网络与非确定性，哈希桶适合测试。
+
+**选择。** 用确定性向量复刻检索形状。**解决的问题：**scope 隔离、top-k 和可重复实验。
+
+**数据流。** `Scope.contains()` 先过滤，查询与记录向量算 cosine，低于 threshold 淘汰，再排序截断；`None` 是 scope 维度通配，但不代替鉴权。
 
 **教学实现**
 ```python
@@ -960,19 +978,21 @@ engine.add(MemoryInput("User prefers Python examples"), scope)
 hits = engine.search("Python examples", scope, threshold=0.10, top_k=5)
 ```
 
-`Scope.contains()` 要求查询中非 `None` 的字段与记录相等；`None` 是通配。它不代替外层鉴权。
+**Mem0 源码对照。** 对应 `Memory.search()` filters、`_search_vector_store()`、`embedding_model.embed()` 与 Vector Store `search()`；`Scope.contains()` 只是 filters 的内存简化。
 
-`DeterministicEmbedder` 把 token 的 SHA-256 映射到固定桶并归一化。它只是**确定性词法教学模型**：共享 token 才易相似，碰撞会造假；没有真正语义能力。search 先算 cosine，低于 threshold 便淘汰。
-
-**解决的问题。** scope 隔离、top-k、重复实验。
-
-**剩余失败。** 同义词、中文分词、跨语言、碰撞和阈值校准未解决。
-
-**Mem0 对应符号。** `Memory.search()` filters、`_search_vector_store()`、`embedding_model.embed()`、Vector Store `search()`；`Scope.contains()` 只是 filters 的内存简化版。
+**取舍。** `DeterministicEmbedder` 将 token 的 SHA-256 映射到固定桶并归一化，只是**确定性词法教学模型**，没有真正语义能力；**剩余失败：**同义词、中文分词、跨语言、碰撞与阈值校准。
 
 ### 9.4 V3：关键词、实体与融合评分
 
-**数据模型变化。** 记录增加 `keywords`、`entities`；结果变为 `SearchHit`，`ScoreDetails` 暴露各路分数。
+**直觉。** 专有名词可能语义分一般，却有很强的精确词或实体证据。
+
+**模型（数据模型变化）。** 记录增加 `keywords`、`entities`；结果变为 `SearchHit`，`ScoreDetails` 暴露各路分数。
+
+**候选方案。** 可只用向量、让关键词独立召回，或在语义候选上融合；demo 选择最后一种以保持最小。
+
+**选择。** 加入词重合和实体 boost。**解决的问题：**精确词与实体改善候选排序。
+
+**数据流。** 先以 semantic threshold 门控；关键词分为 `|query ∩ record| / |query|`，实体交集加 `0.5`，再用 `(semantic + keyword + entity) / max_possible` 归一化并按 `(-score, id)` 排序。
 
 **教学实现**
 ```python
@@ -985,17 +1005,21 @@ hits = engine.search(
 )
 ```
 
-关键词分是 `|query ∩ record| / |query|`，非 BM25；实体交集加 `0.5`。最终分为 `(semantic + keyword + entity) / max_possible`，分母由查询激活信号决定；按 `(-score, id)` 排序，explain 暴露明细。
+**Mem0 源码对照。** 对应 `lemmatize_for_bm25()`、`VectorStoreBase.keyword_search()`、`_compute_entity_boosts()`、`normalize_bm25()` 与 `score_and_rank()`；demo 的词重合并非 BM25。
 
-**解决的问题。** 精确词、实体改善排序。
-
-**剩余失败。** regex 集合忽略词频、长度和语言学，实体由调用者提供；阈值仍先门控语义候选，所以不是真正多路召回。
-
-**Mem0 对应符号。** `lemmatize_for_bm25()`、`keyword_search()`、`_compute_entity_boosts()`、`normalize_bm25()`、`score_and_rank()`；demo 只复刻融合形状。
+**取舍。** 融合可解释但候选仍只来自语义通道；**剩余失败：**regex 忽略词频和语言学、实体由调用者提供，关键词不能救回阈值下候选。
 
 ### 9.5 V4：历史、更新、过期与冲突
 
-**数据模型变化。** 记录增加三个时间字段；`MemoryEngine.events: list[HistoryEvent]` 追加 ADD/UPDATE/DELETE 的 old/new。冲突须由应用确认后 update 或并存。
+**直觉。** 记忆会失效、被纠正或删除，只有当前值不足以解释变化。
+
+**模型（数据模型变化）。** 记录增加 `created_at`、`updated_at`、`expires_at`；`MemoryEngine.events` 追加 ADD/UPDATE/DELETE 的 old/new。
+
+**候选方案。** 可覆盖、只追加，或主记录加事件日志；最后一种兼顾当前读取与变化轨迹。
+
+**选择。** 显式 update/delete 并保留 history。**解决的问题：**支持过期、纠错和追踪；冲突由应用确认后 update 或并存。
+
+**数据流。** search 先跳过 `expires_at < now`；update 保留 ID/创建时间并重算向量、关键词、hash；delete 移除主记录但追加 DELETE event。
 
 **教学实现**
 ```python
@@ -1005,13 +1029,9 @@ audit_trail = engine.history(record.id)
 engine.delete(record.id)
 ```
 
-update 保留 `id`/`created_at`，重算向量、关键词、hash 并写 old/new；delete 移除主记录、保留 DELETE history。search 跳过 `expires_at < now`，无后台 TTL；hash 不识别冲突。
+**Mem0 源码对照。** 对应 `Memory.update()`/`delete()`/`history()`、payload `expiration_date`、SQLite `history` 表及 `SQLiteManager.add_history()`/`get_history()`；OSS 为 UTC 日期粒度，demo 为 `datetime`。
 
-**解决的问题。** 支持过期与纠错。
-
-**剩余失败。** 重启即丢；记录与事件无事务，也无版本、并发控制、级联删除或法规级擦除。
-
-**Mem0 对应符号。** `Memory.update()`/`delete()`/`history()`、payload `expiration_date`、SQLite `history` 表及 `add_history()`/`get_history()`。OSS 是 UTC 日期粒度，demo 是 `datetime`。
+**取舍。** 当前值易读且事件可审计；**剩余失败：**重启即丢、主记录与事件无事务，也无版本、并发控制、级联删除或法规级擦除；hash 不识别冲突。
 
 ### 9.6 教学实现与 Mem0 的符号对照
 
@@ -1019,7 +1039,7 @@ update 保留 `id`/`created_at`，重算向量、关键词、hash 并写 old/new
 |---|---|---|---|
 | `Scope` / `contains()` | user/agent/run 隔离 | Mem0 filters、`_build_filters_and_metadata()` | Provider 过滤更丰富；授权在应用层 |
 | `MemoryRecord` | 正文、向量、hash、scope、时间 | Vector payload / `MemoryItem` | `MemoryItem` 无向量，schema 不等同 |
-| `MemoryEngine.events` | ADD/UPDATE/DELETE 日志 | `SQLiteManager.history`、`add_history()`/`get_history()` | 与主存无共享事务，非合规账本 |
+| `MemoryEngine.events` | ADD/UPDATE/DELETE 日志 | SQLite `history` 表 + `SQLiteManager.add_history()` / `get_history()` | 与主存无共享事务，非合规账本 |
 | 教学 scoring | cosine、词、实体、归一化 | `score_and_rank()` | Mem0 使用 semantic candidates、BM25 和实体索引分数 |
 
 crosswalk 只映射职责。生产仍缺：LLM 抽取质量控制；健壮 tokenizer/BM25；持久化存储；事务/补偿；并发/幂等；Provider 失败降级；离线评测与监控。
@@ -1043,11 +1063,15 @@ conda run -n mem0 python examples/memory_system_design_demo.py
 ```python
 import os
 
+deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+if not deepseek_api_key:
+    raise RuntimeError("DEEPSEEK_API_KEY is required for this optional experiment")
+
 from mem0 import Memory
 
 config = {
     "llm": {"provider": "deepseek", "config": {
-        "model": "deepseek-chat", "api_key": os.environ["DEEPSEEK_API_KEY"]}},
+        "model": "deepseek-chat", "api_key": deepseek_api_key}},
     "embedder": {"provider": "huggingface", "config": {
         "model": "multi-qa-MiniLM-L6-cos-v1"}},
     "vector_store": {"provider": "qdrant", "config": {
