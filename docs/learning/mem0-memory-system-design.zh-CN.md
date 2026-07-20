@@ -576,7 +576,7 @@ Phase 6 的主 insert 与 `ADD` history 都批量优先、失败逐条回退。h
 
 ### 6.5 Phase 7-8：实体关联、最近消息与返回值
 
-Phase 7 批量抽取、去重并嵌入实体；先找精确匹配，再接受相似度 `≥0.95` 的匹配。整体 best-effort。
+Phase 7 基于**全部计划 records** 批量抽取、去重并嵌入实体；先找精确匹配，再接受相似度 `≥0.95` 的匹配。它不知道 Phase 6 哪些逐条 insert 实际成功，因此可能写出指向主记录失败 ID 的 dangling entity links；整体 best-effort。
 
 V3 prompt 的 `linked_memory_ids` 表示新旧 Memory 关联，但当前主路径不持久化它；真正写入的是 NLP 重抽实体后，在**独立实体集合**保存的 Entity→Memory 引用。两者不可混称 memory graph。
 
@@ -603,7 +603,7 @@ sequenceDiagram
         M->>V: batch insert，失败逐条降级
         M->>S: batch ADD history，失败逐条降级
         M-->>N: best-effort 实体索引
-        M->>S: history + 最近消息
+        M->>S: 保存并裁剪最近消息
         M-->>M: 返回计划 records
     end
 ```
@@ -620,10 +620,10 @@ sequenceDiagram
 | batch Embedding | 逐条回退，仍失败则漏 record | 补偿队列 |
 | batch insert | 逐条回退；返回可能多于主存 | read-after-write |
 | history | 逐条回退；主记录可能无审计 | outbox |
-| entity | best-effort；关联增益缺失 | 重建索引 |
+| entity | best-effort；可能缺链接或产生 dangling link | 重建索引 |
 | messages | SQLite 回滚上抛；主存可能成功 | 幂等对账 |
 
-这是主、派生与审计状态的最终一致性写入；history 是否为硬条件由合规策略定义。
+这是**非原子 best-effort 多写**，不是事务，也不能仅凭调用结束称为最终一致性：源码没有内建 retry、outbox 或 reconciliation，不保证状态会自动收敛。只有应用增加幂等重试、主存确认、对账和实体重建后，才可把整套系统设计为 eventual consistency；history 是否为硬条件仍由合规策略定义。
 
 ### 6.8 教学伪代码与 Mem0 源码对照
 
@@ -676,7 +676,7 @@ if mem.get("attributed_to"):
 
 **选择。** OSS 先语义过量召回，再按 ID 加 BM25/entity。高级 filters 的实际能力取决于 Provider。
 
-query trim 后须非空，`threshold∈[0,1]`，`top_k` 是非负非 bool 整数；三个 scope ID 至少一个且必须放 filters。
+query trim 后须非空，`threshold∈[0,1]`，`top_k` 是非负非 bool 整数；三个 scope ID 至少一个且必须放 filters。例如 `filters={"user_id": "u1", "AND": [{"project": {"eq": "mem0"}}, {"priority": {"gte": 2}}]}` 表示先限定用户空间，再以 project 与 priority 元数据继续收窄；scope 与这些条件组合，而非被 prompt 替换。协调层会转换 AND 与比较操作，但具体 Provider 能否忠实实现 `gte`、OR/NOT、`contains` 等仍须查其过滤适配并做集成测试。
 
 ### 7.2 查询预处理、Embedding 与过量召回
 
@@ -750,7 +750,7 @@ max\_possible=1.0+\mathbb{1}_{BM25\ active}\times1.0+\mathbb{1}_{entity\ active}
 final(d)=\min\left(\frac{raw(d)}{max\_possible},1.0\right)
 \]
 
-“active”指整次查询的 score dict 非空。数值例：4-term query 得 `(m,k)=(7,.6)`；A 的 semantic=`.72`、raw BM25=`9`，规范后 `.769`；实体 similarity=`.8`、`n=1`，boost=`.4`。两路 active，分母 `2.5`：
+“active”是**查询全局**状态：`score_and_rank()` 在候选循环外用 `bool(bm25_scores)` / `bool(entity_boosts)` 固定一次分母。某候选缺少 keyed 分数时该项取 0，但仍使用同一全局分母。数值例：4-term query 得 `(m,k)=(7,.6)`；A 的 semantic=`.72`、raw BM25=`9`，规范后 `.769`；实体 similarity=`.8`、`n=1`，boost=`.4`。两路 active，分母 `2.5`：
 
 \[
 final_A=(0.72+0.769+0.4)/2.5\approx0.756
@@ -762,14 +762,20 @@ final_A=(0.72+0.769+0.4)/2.5\approx0.756
 
 **教学实现**
 ```python
-def hybrid_score(semantic, bm25, entity, threshold):
+def hybrid_score(semantic, bm25, entity, threshold, *,
+                 has_bm25: bool, has_entity: bool):
     if semantic < threshold:
         return None
     raw = semantic + (bm25 or 0.0) + (entity or 0.0)
-    maximum = 1.0 + (1.0 if bm25 is not None else 0.0)
-    maximum += 0.5 if entity is not None else 0.0
+    maximum = 1.0 + (1.0 if has_bm25 else 0.0)
+    maximum += 0.5 if has_entity else 0.0
     return min(raw / maximum, 1.0)
-assert round(hybrid_score(0.72, 0.769, 0.4, 0.1), 3) == 0.756
+
+
+assert round(hybrid_score(0.72, 0.769, 0.4, 0.1,
+                          has_bm25=True, has_entity=True), 3) == 0.756
+assert hybrid_score(0.72, None, None, 0.1,
+                    has_bm25=True, has_entity=True) == 0.288
 ```
 
 ### 7.6 explain 与可选 reranker
@@ -824,7 +830,7 @@ reranker 只接收融合后的 top_k，无法找回候选、过期或 threshold 
 
 payload 合并旧值与 metadata，重算向量、MD5 hash、lemma，保留 `created_at`、刷新 `updated_at`。仅更新 metadata 也重算正文向量；已有 `actor_id` 强制保留，调用者不能覆盖。
 
-主更新后写 `UPDATE` history。正文变化才清理旧实体引用并重建；实体异常 best-effort，主存/history 异常上抛。顺序是主存→history→entity，无跨存储回滚。
+主更新后写 `UPDATE` history。正文变化才调用旧实体清理再链接新实体，但 `_remove_memory_from_entity_store()` 在当前实例 `_entity_store is None` 时直接返回；随后的新实体链接会惰性初始化集合，却不会补做旧引用清理，因此跨实例复用实体集合时可能遗留旧正文的链接。即使 store 已初始化，单项异常也会被吞掉。顺序是主存→history→best-effort entity，无跨存储回滚。
 
 **教学实现。** 显式确认纠错：
 
@@ -836,9 +842,11 @@ def confirm_correction(memory, old_id: str, new_text: str) -> None:
 
 ### 8.3 delete、delete_all 与 reset
 
-`delete(id)` 依次删除主向量、写 `DELETE` history（`new_memory=None, is_deleted=1`）、best-effort 清实体引用；history 失败时主向量已删，无法回滚。
+`delete(id)` 依次删除主向量、写 `DELETE` history（`new_memory=None, is_deleted=1`）、调用 best-effort 实体清理；history 失败时主向量已删。若当前实例从未初始化 entity store，cleanup 直接返回，可能完全不触碰底层已有实体集合并留下 dangling link。
 
-`delete_all()` 要 scope 且逐条删除，可能部分完成；无 scope 应用 `reset()`，它清 SQLite、重建主集合并重置 entity store，是全局操作。
+`delete_all()` 要 scope，但当前只调用一次 `vector_store.list(filters=filters)`，不传分页游标或 `top_k`，再逐条删除这一页并返回成功。Provider 默认页大小可能导致漏删；Qdrant 的 `list(..., top_k=100)` 当前最多取 100 条。生产实现应显式分页直到空，记录期望/实际删除数，并 read-after-delete 验证 scope 内计数为零。
+
+无 scope 时 API 要求调用无作用域 `reset()`。它清 SQLite 并重建主集合；只有当前实例 `_entity_store is not None` 时才尝试 reset entity store。若集合由之前进程建立、当前实例尚未惰性初始化，它不会被触碰。因此 reset 是破坏性的全局入口，却不保证跨实例实体集合也已清空。
 
 ### 8.4 expiration_date 与查询时过滤
 
@@ -885,15 +893,16 @@ stateDiagram-v2
     end note
     note right of Deleted
       主向量删除 / history 可留痕
+      entity link 也可能残留
     end note
 ```
 
-四者是**教学概念**，不是当前枚举/同表 flags；仅 history 行有 `is_deleted` 删除事件标记。
+四者是**教学概念**，不是当前枚举/同表 flags；仅 history 行有 `is_deleted` 删除事件标记，图中的 Deleted 只保证主向量删除，不代表所有派生副本清空。
 
 **取舍。** update 简化查询但隐藏演变；supersede 保留证据但需过滤；过期可预测但不擦除。删除与审计的平衡来自数据政策。
 
 ### 8.8 本章练习与面试思考
 
-1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及回滚边界。
-2. **源码推演题：** 一条昨天过期的记录分别调用 `get()`、`search(show_expired=False)`、`search(show_expired=True)`，根据源码判断可见性差异。
+1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及 `_entity_store is None` 分支。
+2. **设计决策题：** 为“删除某用户全部偏好”设计分页直到空、计数验证、entity/history/backup 策略，并定义部分失败时是否返回成功。
 3. **面试题：** `delete_all()` 与 `reset()` 为何分开？ADD-only 与 supersede 如何处理冲突？
