@@ -18,6 +18,23 @@ def test_scope_requires_at_least_one_owner():
         Scope()
 
 
+def test_scope_rejects_whitespace_only_owner():
+    with pytest.raises(ValueError, match="whitespace-only"):
+        Scope(user_id="   ")
+
+
+def test_scope_normalizes_surrounding_whitespace():
+    scope = Scope(user_id=" alice ", agent_id=" coding-agent ")
+
+    assert scope.user_id == "alice"
+    assert scope.agent_id == "coding-agent"
+
+
+def test_scope_rejects_internal_whitespace_like_mem0():
+    with pytest.raises(ValueError, match="cannot contain whitespace"):
+        Scope(user_id="alice smith")
+
+
 def test_add_deduplicates_within_scope_but_not_across_users():
     engine = MemoryEngine()
     memory = MemoryInput("User prefers Python examples", entities=("Python",))
@@ -29,6 +46,50 @@ def test_add_deduplicates_within_scope_but_not_across_users():
     assert duplicate.id == first.id
     assert other_user.id != first.id
     assert len(engine.records) == 2
+
+
+def test_add_recreates_same_text_after_existing_memory_expires():
+    engine = MemoryEngine()
+    scope = Scope(user_id="alice")
+    original = engine.add(
+        MemoryInput("Temporary debugging context", expires_at=NOW + timedelta(hours=1)),
+        scope,
+        now=NOW,
+    )
+    readded_at = NOW + timedelta(hours=2)
+    replacement_expires_at = readded_at + timedelta(hours=3)
+
+    replacement = engine.add(
+        MemoryInput("Temporary debugging context", expires_at=replacement_expires_at),
+        scope,
+        now=readded_at,
+    )
+
+    assert replacement.id != original.id
+    assert replacement.expires_at == replacement_expires_at
+    assert [hit.record.id for hit in engine.search("debugging context", scope, now=readded_at)] == [replacement.id]
+    assert [event.event for event in engine.history(replacement.id)] == ["ADD"]
+    assert engine.search("debugging context", scope, now=replacement_expires_at + timedelta(seconds=1)) == []
+
+
+def test_add_deduplicates_when_expiration_equals_now():
+    engine = MemoryEngine()
+    scope = Scope(user_id="alice")
+    expires_at = NOW + timedelta(hours=1)
+    original = engine.add(
+        MemoryInput("Boundary debugging context", expires_at=expires_at),
+        scope,
+        now=NOW,
+    )
+
+    duplicate = engine.add(
+        MemoryInput("Boundary debugging context", expires_at=expires_at + timedelta(hours=2)),
+        scope,
+        now=expires_at,
+    )
+
+    assert duplicate.id == original.id
+    assert duplicate.expires_at == expires_at
 
 
 def test_search_combines_semantic_keyword_and_entity_signals():
@@ -54,6 +115,17 @@ def test_search_combines_semantic_keyword_and_entity_signals():
     assert hits[0].details.semantic_score > 0
     assert hits[0].details.keyword_score > 0
     assert hits[0].details.entity_boost == pytest.approx(0.5)
+
+
+def test_search_isolates_results_across_users():
+    engine = MemoryEngine()
+    alice = engine.add(MemoryInput("Private Python preference"), Scope(user_id="alice"), now=NOW)
+    bob = engine.add(MemoryInput("Private Python preference"), Scope(user_id="bob"), now=NOW)
+
+    alice_hits = engine.search("Private Python preference", Scope(user_id="alice"), now=NOW)
+
+    assert [hit.record.id for hit in alice_hits] == [alice.id]
+    assert bob.id not in {hit.record.id for hit in alice_hits}
 
 
 def test_semantic_threshold_runs_before_keyword_boost():

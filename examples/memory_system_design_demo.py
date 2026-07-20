@@ -57,6 +57,16 @@ class Scope:
     run_id: str | None = None
 
     def __post_init__(self) -> None:
+        for field_name in ("user_id", "agent_id", "run_id"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            normalized = value.strip()
+            if not normalized:
+                raise ValueError(f"{field_name} cannot be empty or whitespace-only")
+            if any(character.isspace() for character in normalized):
+                raise ValueError(f"{field_name} cannot contain whitespace")
+            object.__setattr__(self, field_name, normalized)
         if not any((self.user_id, self.agent_id, self.run_id)):
             raise ValueError("at least one scope id is required")
 
@@ -122,6 +132,8 @@ class SearchHit:
 
 
 class MemoryEngine:
+    """Trusted teaching engine; its ID-only methods are not multi-tenant APIs."""
+
     def __init__(self, embedder: Embedder | None = None):
         self.embedder = embedder or DeterministicEmbedder()
         self.records: dict[str, MemoryRecord] = {}
@@ -139,6 +151,8 @@ class MemoryEngine:
         normalized = normalize_text(memory.text)
         content_hash = hashlib.md5(normalized.encode()).hexdigest()
         for record in self.records.values():
+            if record.expires_at is not None and record.expires_at < current_time:
+                continue
             if record.scope == scope and record.content_hash == content_hash:
                 return record
 

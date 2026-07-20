@@ -6,7 +6,7 @@
 
 ### 1.1 学习目标与贯穿案例
 
-**直觉。** 假设你在构建带长期记忆的 AI 编程助手。用户说“示例默认用 Python，回答先给结论”，后来又排查过 Qdrant 向量维度不一致，并形成“改 TypeScript 后依次运行 typecheck、test、build”的习惯。当前任务正在分析混合检索；新项目又从 Redis 改用 pgvector。这些文本的归属、寿命和用法都不同，不能只是“全部放进向量库”。
+**直觉。** AI 编程助手要记住“默认 Python”、Qdrant 维度故障、TypeScript 检查顺序、当前混合检索任务及 Redis→pgvector 变化；它们归属、寿命和用法不同，不能全部塞进向量库。
 
 **模型。** 记忆系统要持续回答五个设计问题：
 
@@ -16,11 +16,9 @@
 4. **如何召回（how retrieved）**：精确、向量、关键词、实体、图还是混合检索？
 5. **何时遗忘（when forgotten）**：瞬时、TTL、长期、衰减还是审计保留？
 
-输入是消息和业务上下文，输出是带作用域、表示、索引字段与生命周期的记录；约束包括隔离、可追溯、延迟、成本和隐私。读完前五章，读者应能区分记忆与相邻系统，完成分类选型，画出 Python OSS `Memory` 的组件与存储边界，并准确区分 OSS 和 Hosted Platform。
+输入是消息和业务上下文，输出是带 scope、表示、索引与生命周期的记录，受隔离、追溯、延迟、成本和隐私约束。前五章完成边界、选型及 Python OSS `Memory` 组件/存储分析。
 
-**候选方案。** 可以从 quickstart 向下追 API、从数据库表向上猜架构，或先建模型再对照源码。前两种快，却容易把某版本的偶然实现当成原理。
-
-**选择。** 本文采用“设计决策 + 最小实现 + 当前源码证据”：先问约束，再比较候选方案，最后检查定义、调用点和失败边界。
+**选择。** quickstart 或数据库逆推虽快，却易把偶然实现当原理；本文先问约束、比较方案，再以最小实现和当前源码检查调用及失败边界。
 
 ### 1.2 三类代码标记
 
@@ -41,34 +39,13 @@ flowchart LR
     V3 --> V4[V4 历史 + 更新 + 过期]
 ```
 
-**教学实现。** 下面的函数提醒我们：不同标签不能互相冒充。
-
-**教学实现**
-```python
-def evidence_scope(tag: str) -> str:
-    levels = {
-        "概念伪代码": "idea",
-        "教学实现": "mechanism",
-        "Mem0 源码": "current_repository",
-    }
-    return levels[tag]
-```
-
-**Mem0 源码对照。** `mem0/__init__.py` 暴露两组入口：本地 OSS 组合对象与 Hosted Platform 客户端。
-
-**Mem0 源码**
-```python
-from mem0.client.main import AsyncMemoryClient, MemoryClient
-from mem0.memory.main import AsyncMemory, Memory
-```
-
-名称相近不代表执行位置、存储或能力相同。`Memory` / `AsyncMemory` 在本进程组装 Provider；`MemoryClient` / `AsyncMemoryClient` 访问远端服务。
+三类标签不能互相冒充。`mem0/__init__.py` 暴露本地 `Memory`/`AsyncMemory` 与远端 `MemoryClient`/`AsyncMemoryClient`；名称相近不代表执行位置、存储或能力相同。
 
 ### 1.3 推荐阅读路线
 
-系统设计读者可按第 2→3→5 章阅读；源码读者先用第 4 章定位边界，再从 `Memory.__init__()`、`add()`、`search()` 展开；实验读者先建立分类模型，再运行后续本地教学实现。真实 DeepSeek、Qdrant 和 API Key 只应是可选实验。
+设计读者按 2→3→5；源码读者按 4→`Memory.__init__()`→`add()`/`search()`；实验读者先分类再运行本地 demo。DeepSeek/Qdrant 仅为可选实验。
 
-**取舍。** 设计先行比复制示例慢，却能避免把 transcript 当 memory、漏掉作用域过滤、或误把多存储 best-effort 写入当成事务。代价是同时维护理论与实现两张图，因此本文始终用三类代码标签标明证据。
+**取舍。** 设计先行较慢，却能避免混淆 transcript/memory、漏 scope 或把 best-effort 当事务；三类标签用于区分理论与实现证据。
 
 **本章练习与面试思考：**
 
@@ -127,13 +104,20 @@ flowchart LR
 ```python
 def validate_scope(scope: dict[str, str | None]) -> dict[str, str]:
     keys = ("user_id", "agent_id", "run_id")
-    clean = {key: scope[key].strip() for key in keys if scope.get(key)}
+    clean = {}
+    for key in keys:
+        if scope.get(key) is None:
+            continue
+        value = scope[key].strip()
+        if not value or any(char.isspace() for char in value):
+            raise ValueError(f"invalid {key}")
+        clean[key] = value
     if not clean:
         raise ValueError("at least one scope id is required")
     return clean
 ```
 
-**Mem0 源码对照。** `mem0/memory/main.py::_build_filters_and_metadata()` 校验并修剪这三个 ID，将全部已提供 ID 同时加入存储 metadata 与查询 filters；三者皆空则抛出 `Mem0ValidationError`。这落实操作 scope，但不替代 API 鉴权，也不能保证自定义 Provider 的底层隔离。
+**Mem0 源码对照。** `mem0/memory/main.py::_validate_and_trim_entity_id()` 会把 ID 转为字符串、去除首尾空白，并拒绝空值、纯空白与内部空白；`_build_filters_and_metadata()` 将全部已提供 ID 同时加入写 metadata 和查询 filters，三者皆空则抛出 `Mem0ValidationError`。这落实 scoped 入口的查询构造，但不替代 API 鉴权，也不能保证自定义 Provider 的底层隔离。
 
 **Mem0 源码**
 ```python
@@ -316,7 +300,7 @@ flowchart TB
 
 ### 4.2 OSS Library、Server、OpenMemory 与 Platform
 
-**候选方案。** Library 在应用进程内运行，透明但由应用承担密钥、扩缩容和一致性；Server 提供集中 API 与鉴权，增加网络和运维；OpenMemory 提供 UI、MCP 与完整自托管体验；Hosted Platform 通过客户端使用托管能力，降低运维但改变数据、成本和网络边界。
+**候选方案。** Library 透明但由应用承担密钥与一致性；Server 集中 API/鉴权但增加网络运维；OpenMemory 提供 UI/MCP；Hosted Platform 降低运维但改变数据、成本和网络边界。
 
 | 形态 | 执行/状态边界 | 接口 | 适用场景 |
 |---|---|---|---|
@@ -325,7 +309,7 @@ flowchart TB
 | OpenMemory | 自建完整应用 | UI、API、MCP | 可视化与 Agent 工具 |
 | Hosted Platform | Mem0 托管边界 | Client/API | 零运维与平台能力 |
 
-**选择。** 为了证据可复核，本文解剖 OSS Library。Server 鉴权、OpenMemory 数据模型与 Platform 的时间、衰减、规模能力不从 `Memory` 推断。
+**选择。** 本文只解剖可复核的 OSS Library，不从 `Memory` 推断 Server/OpenMemory/Platform 内部能力。
 
 ### 4.3 Memory 的组件组合
 
@@ -341,7 +325,7 @@ flowchart TB
     M --> R[可选 Reranker]
     M --> Q[(SQLiteManager)]
     Q --> H[history]
-    Q --> MSG[messages: 每 scope 最近 10 条]
+    Q --> MSG[messages: 目标窗口 10 条<br/>同批顺序有缺陷]
     M -.首次实体操作.-> ES[(Lazy Entity Store)]
     E --> V
     E --> ES
@@ -478,7 +462,7 @@ erDiagram
 
 ### 5.4 主集合、实体集合和 SQLite 辅助状态
 
-**数据流。** 主向量、惰性实体集合、SQLite history 和 SQLite messages 是四块逻辑状态。实体集合名由主集合名派生；Qdrant embedded 可共享 client，但仍是独立集合。
+**数据流。** 主向量、惰性实体集合、SQLite history/messages 是四块逻辑状态；即使 Qdrant embedded 共享 client，实体仍是独立集合。
 
 **概念伪代码（Mermaid）**
 ```mermaid
@@ -494,7 +478,7 @@ flowchart LR
     U -.best-effort 清理/重建.-> E
 ```
 
-**关键不变量：vector memory、entity records、history、recent messages 是分离存储，没有共享事务。** 主 insert 后才写 SQLite history；实体链接是独立 best-effort；最近消息另开 SQLite 事务。可能出现主记录成功但 history/实体失败，或逐条降级导致部分成功。对外必须定义“成功包含哪些存储”，失败后也要能对账。
+**关键不变量：四类状态没有共享事务。** 主 insert 后写 history，实体是 best-effort，messages 另开事务；会出现部分成功。接口须定义成功范围并支持对账。
 
 ### 5.5 多租户隔离与作用域不变量
 
@@ -520,13 +504,13 @@ for key in sorted(["user_id", "agent_id", "run_id"]):
 return "&".join(parts)
 ```
 
-多租户还需要 API 鉴权、领域授权和底层 Provider 正确执行过滤；本地 ID 校验只覆盖查询构造的一部分。主记忆与实体都应带 scope，写、搜、更新、删除、对账使用同一规则；`actor_id` 只能缩小而不能扩大 scope。
+多租户还需要 API 鉴权、领域授权和底层 Provider 正确执行过滤；本地 ID 校验只覆盖 scoped 查询构造。当前 OSS `add()`、`search()`、`get_all()`、`delete_all()` 有 scope 参数/过滤，但 `get(memory_id)`、`update(memory_id, ...)`、`delete(memory_id)`、`history(memory_id)` 是**直接 ID API**：它们不接收 scope，也不验证该 ID 是否属于当前主体。调用服务必须在进入这些 API 前完成鉴权与目标归属校验；“先 `get()` 再检查、随后 mutation”仍有 TOCTOU，不是原子授权。生产应采用 scope-aware 条件写/删，或在权威表事务中锁定并校验归属后更新，再异步同步索引。`actor_id` 只能缩小查询，不能扩大 scope。
 
 **取舍。** scope 越细，泄漏半径越小，但跨项目学习需显式聚合。单库事务主表再异步索引易恢复但有新鲜度窗口；多 Provider + SQLite 灵活却依赖幂等、outbox/补偿和对账。组织共享记忆应审核写入，而非自动把任意对话升级为组织事实。
 
 ### 5.6 本章练习与面试思考
 
-1. **代码阅读题：** 阅读 `SQLiteManager` 两张表，解释 `save_messages()` 如何按 `session_scope` 只保留最近 10 条。
+1. **代码阅读题：** 阅读 `SQLiteManager.save_messages()`，构造同批 12 条消息，说明为何只按同一 `created_at` 无法保证留下输入末 10 条。
 2. **设计决策题：** 主向量成功、实体写失败时应返回成功、失败还是“待修复”？先定义实体是否为核心能力和重试幂等。
 3. **面试题：** 用“访问空间—发送者—协议角色—事实对象”解释 `user_id`、`actor_id`、`role`、`attributed_to`。
 4. **源码推演题：** 阅读 `_update_memory()`，列出文本变化时重算字段、actor 保留、history 与 entity cleanup 顺序及部分失败。
@@ -559,7 +543,9 @@ return "&".join(parts)
 
 ### 6.3 Phase 0-2：上下文、已有记忆与单次 LLM 抽取
 
-Phase 0 按键名排序拼接 scope；`user_id="u1"`、`run_id="r7"` 得到稳定 key `run_id=r7&user_id=u1`。SQLite 按 key 分区，写后只留最近 10 条，读取时恢复时间正序。
+Phase 0 按键名排序拼接 scope；`user_id="u1"`、`run_id="r7"` 得到稳定 key `run_id=r7&user_id=u1`。`SQLiteManager.save_messages()` **意图**按 key 只保留最近 10 条，`get_last_messages()` 也意图恢复时间正序；但一次 `save_messages()` 给整批消息写相同 `created_at`，裁剪和读取都只按 `created_at` 排序，没有 tie-break。因此单批 12 条时不能保证留下输入的第 3–12 条，也不能保证同批返回顺序；这是真实源码边界，而非“最后 10 条/正序”的契约。
+
+生产/SDK 修复应保存单调 `sequence`/插入序并用 `(created_at, sequence)` 排序，或为每条消息生成有序时间。`(created_at, id)` 只有在 `id` 本身按输入顺序单调时才正确；当前随机 UUID 不表达输入顺序，最多提供任意的稳定全序。应补“单批超过 10 条”的回归测试，同时断言保留集合和时间正序。
 
 Phase 1 在 scope 内语义搜索，固定 `top_k=10`。UUID 以小整数呈现给 LLM，并建反向 `uuid_mapping` 降低 ID 幻觉；后续主写未消费它。
 
@@ -590,7 +576,7 @@ sequenceDiagram
     participant E as Embedder
     participant V as 主 Vector Store
     participant N as Entity Store
-    M->>S: 稳定 scope + 最近 10 条
+    M->>S: 稳定 scope + 目标窗口 10 条（同批顺序无保证）
     M->>V: scope 内语义候选 top_k=10
     M->>L: 一次 ADD-only JSON 抽取
     alt Provider 失败
@@ -825,7 +811,7 @@ reranker 只接收融合后的 top_k，无法找回候选、过期或 threshold 
 
 ### 8.2 update 的重算范围
 
-**数据流。** update 至少给 text、metadata 或 expiration；`data` 旧别名会 warning。缺 ID 报 `ValueError`，底层 get 故障原样上抛。
+**数据流。** update 至少给 text、metadata 或 expiration；`data` 旧别名会 warning。缺 ID 报 `ValueError`，底层 get 故障原样上抛。入口只有 `memory_id`，没有 scope/主体参数；以下重算流程不是授权检查。
 
 payload 合并旧值与 metadata，重算向量、MD5 hash、lemma，保留 `created_at`、刷新 `updated_at`。仅更新 metadata 也重算正文向量；已有 `actor_id` 强制保留，调用者不能覆盖。
 
@@ -841,11 +827,11 @@ def confirm_correction(memory, old_id: str, new_text: str) -> None:
 
 ### 8.3 delete、delete_all 与 reset
 
-`delete(id)` 依次删除主向量、写 `DELETE` history（`new_memory=None, is_deleted=1`）、调用 best-effort 实体清理；history 失败时主向量已删。若当前实例从未初始化 entity store，cleanup 直接返回，可能完全不触碰底层已有实体集合并留下 dangling link。
+`delete(id)` 依次删除主向量、写 `DELETE` history（`new_memory=None, is_deleted=1`）、调用 best-effort 实体清理；它与 `get(id)`、`update(id)`、`history(id)` 一样仅凭 ID，不核验调用主体或 scope。history 失败时主向量已删。若当前实例从未初始化 entity store，cleanup 直接返回，可能完全不触碰底层已有实体集合并留下 dangling link。
 
-`delete_all()` 要 scope，但当前只调用一次 `vector_store.list(filters=filters)`，不传分页游标或 `top_k`，再逐条删除这一页并返回成功。Provider 默认页大小可能导致漏删；Qdrant 的 `list(..., top_k=100)` 当前最多取 100 条。生产实现应显式分页直到空，记录期望/实际删除数，并 read-after-delete 验证 scope 内计数为零。
+`delete_all()` 要 scope，却只调用一次 `vector_store.list(filters=filters)` 再逐条删除；Provider 默认页可能漏删，Qdrant 当前默认最多 100 条。生产应分页到空、记录计数并 read-after-delete。
 
-无 scope 时 API 要求调用无作用域 `reset()`。它清 SQLite 并重建主集合；只有当前实例 `_entity_store is not None` 时才尝试 reset entity store。若集合由之前进程建立、当前实例尚未惰性初始化，它不会被触碰。因此 reset 是破坏性的全局入口，却不保证跨实例实体集合也已清空。
+无 scope 的全局入口是 `reset()`：清 SQLite、重建主集合，但只在当前实例已初始化 `_entity_store` 时 reset 实体；旧进程留下而本实例未初始化的实体集合不会被触碰。
 
 ### 8.4 expiration_date 与查询时过滤
 
@@ -902,7 +888,7 @@ stateDiagram-v2
 
 ### 8.8 本章练习与面试思考
 
-1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及 `_entity_store is None` 分支。
+1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及 `_entity_store is None` 分支，并确认 direct-ID 入口没有 scope 校验。
 2. **设计决策题：** 为“删除某用户全部偏好”设计分页直到空、计数验证、entity/history/backup 策略，并定义部分失败时是否返回成功。
 3. **面试题：** `delete_all()` 与 `reset()` 为何分开？ADD-only 与 supersede 如何处理冲突？
 
@@ -945,7 +931,7 @@ def remember_v0(message: str) -> None:
 
 **选择。** 调用者先给出事实，再逐条写入。**解决的问题：**事实可独立去重和检索。
 
-**数据流。** `facts → MemoryInput → normalize → MD5 → MemoryRecord`；scope 与 hash 都相同时复用记录。
+**数据流。** `facts → MemoryInput → normalize → MD5 → MemoryRecord`；demo 在 scope 与 hash 相同且旧记录在 `now` 尚未过期时复用记录。
 
 **教学实现**
 ```python
@@ -953,15 +939,15 @@ def remember_v1(engine: MemoryEngine, facts: list[str], scope: Scope) -> list[st
     return [engine.add(MemoryInput(text=fact), scope).id for fact in facts]
 ```
 
-**Mem0 源码对照。** 对应 `Memory.add()`、V3 extraction prompt、`_add_to_vector_store()`、`_create_memory()` 的 payload `data`/`hash`。自动推断是 ADD-only；demo 自身没有 LLM 抽取器，`facts` 由调用者提供。
+**Mem0 源码对照。** 对应 `Memory.add()`、V3 extraction prompt、`_add_to_vector_store()`、`_create_memory()` 的 payload `data`/`hash`。自动推断是 ADD-only；demo 自身没有 LLM 抽取器，`facts` 由调用者提供。demo 的过期感知去重是教学策略，不是 Mem0 当前 MD5 去重的完整复刻：OSS add 的 10 条现有候选未在该路径先做 expiration 过滤，过期同文仍可能阻止新增。
 
-**取舍。** MD5 仅做规范化文本的 scope 内精确去重，不是语义去重或权限机制；**剩余失败：**同义改写、否定、归因和冲突仍由上游处理。
+**取舍。** MD5 仅做规范化文本的 scope 内精确去重，不是语义去重或权限机制；跳过过期记录能重新 add，却保留旧物理记录。**剩余失败：**同义改写、否定、归因、冲突和过期清理仍由上游处理。
 
 ### 9.3 V2：作用域、Embedding 与语义检索
 
 **直觉。** 事实变短后仍需先隔离所有者，再按查询相关性找回。
 
-**模型（数据模型变化）。** 记录增加 `Scope(user_id, agent_id, run_id)`、`vector`、`keywords` 与时间；至少一个 scope ID 必填。
+**模型（数据模型变化）。** 记录增加 `Scope(user_id, agent_id, run_id)`、`vector`、`keywords` 与时间；ID 会去除首尾空白，拒绝空值/纯空白/内部空白，且至少一个必填，与 OSS 校验边界一致。
 
 **候选方案。** 精确匹配简单但漏同义表达，真实 Embedding 较强但引入网络与非确定性，哈希桶适合测试。
 
@@ -1016,7 +1002,7 @@ hits = engine.search(
 
 **候选方案。** 可覆盖、只追加，或主记录加事件日志；最后一种兼顾当前读取与变化轨迹。
 
-**选择。** 显式 update/delete 并保留 history。**解决的问题：**支持过期、纠错和追踪；冲突由应用确认后 update 或并存。
+**选择。** 显式 update/delete 并保留 history。add 去重忽略 `expires_at < now` 的旧记录，故过期同文会获得新 ID、新 TTL 和新的 ADD history；旧记录保留用于教学观察。`expires_at == now` 仍未过期并继续去重。**解决的问题：**过期后可重新激活同文、支持纠错和追踪；冲突由应用确认后 update 或并存。
 
 **数据流。** search 先跳过 `expires_at < now`；update 保留 ID/创建时间并重算向量、关键词、hash；delete 移除主记录但追加 DELETE event。
 
@@ -1028,9 +1014,9 @@ audit_trail = engine.history(record.id)
 engine.delete(record.id)
 ```
 
-**Mem0 源码对照。** 对应 `Memory.update()`/`delete()`/`history()`、payload `expiration_date`、SQLite `history` 表及 `SQLiteManager.add_history()`/`get_history()`；OSS 为 UTC 日期粒度，demo 为 `datetime`。
+**Mem0 源码对照。** 对应 `Memory.update()`/`delete()`/`history()`、payload `expiration_date`、SQLite `history` 表及 `SQLiteManager.add_history()`/`get_history()`；OSS 为 UTC 日期粒度，demo 为 `datetime`。这里的过期感知 add 去重是刻意修正的教学策略，当前 OSS 不保证该行为。
 
-**取舍。** 当前值易读且事件可审计；**剩余失败：**重启即丢、主记录与事件无事务，也无版本、并发控制、级联删除或法规级擦除；hash 不识别冲突。
+**取舍。** 当前值易读且事件可审计；保留旧过期记录会增长存储，需后台回收。**剩余失败：**重启即丢、主记录与事件无事务，也无版本、并发控制、级联删除或法规级擦除；hash 不识别冲突。
 
 ### 9.6 教学实现与 Mem0 的符号对照
 
@@ -1040,8 +1026,9 @@ engine.delete(record.id)
 | `MemoryRecord` | 正文、向量、hash、scope、时间 | Vector payload / `MemoryItem` | `MemoryItem` 无向量，schema 不等同 |
 | `MemoryEngine.events` | ADD/UPDATE/DELETE 日志 | SQLite `history` 表 + `SQLiteManager.add_history()` / `get_history()` | 与主存无共享事务，非合规账本 |
 | 教学 scoring | cosine、词、实体、归一化 | `score_and_rank()` | Mem0 使用 semantic candidates、BM25 和实体索引分数 |
+| `update/delete/history(id)` | 可信内部教学操作 | OSS 同名 direct-ID API | 都不验证 scope；不可直接暴露为多租户外部 API |
 
-crosswalk 只映射职责。生产仍缺：LLM 抽取质量控制；健壮 tokenizer/BM25；持久化存储；事务/补偿；并发/幂等；Provider 失败降级；离线评测与监控。
+crosswalk 只映射职责。demo 的 update/delete/history 是可信内部教学接口；跨用户 search 测试只证明查询过滤，**不能证明 ID-only mutation 安全**。外部服务须用 scope-aware 条件 mutation，或在权威表事务中鉴权并校验归属；非原子的“先 get 再 check”不是安全边界。生产还缺抽取质控、持久化、事务/补偿、并发幂等、Provider 降级与评测监控。
 
 ### 9.7 运行确定性演示
 
@@ -1084,7 +1071,7 @@ memory = Memory.from_config(config)
 
 ### 9.9 本章练习与面试思考
 
-1. **代码阅读题：** 标出 scope、过期、threshold 顺序，解释为何不能救回候选。
+1. **代码阅读题：** 标出 scope、过期、threshold 顺序，再比较 direct-ID CRUD 为何没有同样的隔离证明。
 2. **实现题：** 增加 `idempotency_key`，写出并发 add 的不变量。
 3. **设计决策题：** 合并 semantic/BM25 候选，并处理主存成功、history 失败。
 4. **面试题：** 为何确定性 embedder 不能证明语义能力？如何用 Recall@k、MRR 评测？
@@ -1093,9 +1080,7 @@ memory = Memory.from_config(config)
 
 ### 10.1 幂等、并发与重复写入
 
-生产不变量是“同一来源事件、抽取版本和作用域至多产生一组逻辑事实”。以 `tenant_id + user/agent/run scope + source_event_id + extractor_version` 生成 `idempotency_key`；事实附 `fact_ordinal`/稳定 fact key 并建唯一约束。文本 hash 只做组内去重，既不识别同义改写，也可能误合并同文事件。
-
-消费者以 key 领取 `PENDING` 租约，靠唯一约束/CAS 提交 `COMMITTED`；接管者复用 logical ID。显式 update 带版本/ETag。当前 MD5 与候选检索无跨进程唯一约束，只能降低重复概率。
+生产要求同一来源事件、抽取版本和 scope 至多产生一组逻辑事实。用 `tenant + scope + source_event_id + extractor_version` 生成 `idempotency_key`，事实以 ordinal/稳定 key 建唯一约束；消费者租约领取 `PENDING`，CAS 提交 `COMMITTED`，update 带版本。文本 MD5 不识别同义改写，也没有跨进程唯一性。
 
 ### 10.2 原子性、补偿与最终一致性
 
@@ -1110,7 +1095,7 @@ memory = Memory.from_config(config)
 | entity insert/update | 异常捕获后继续；insert/外围失败 warning，单项 update 仅 debug | 实体增强静默降质 | 缺链接、重复实体或 dangling link，可观测性不足 | union 有一定幂等性，但并发读改写不安全 | 定义为派生索引并版本化重建；CAS/upsert 与孤儿扫描 |
 | reranker | 捕获异常并回退融合结果 | 排序质量下降、仍有结果 | 无持久一致性风险 | 查询重试安全 | 熔断、超时、fallback 指标；保留融合分与 rerank 版本便于回放 |
 
-主写失败要阻止辅助索引确认；合规 history 失败保持 `PENDING`；entity 失败可 `DEGRADED` 后重建。删除须分页到空并覆盖实体、history、日志和备份，不能依赖单页 `delete_all()` 或未初始化 entity 的 `reset()`。
+主写失败应阻止辅助索引确认；合规 history 失败保持 `PENDING`，entity 失败标 `DEGRADED` 后重建。删除须分页到空并覆盖所有副本。
 
 ### 10.3 批处理、重试、降级和背压
 
@@ -1118,16 +1103,9 @@ memory = Memory.from_config(config)
 
 ### 10.4 成本、延迟与容量规划
 
-设每天有 $W$ 个来源事件，典型事件抽取 $F$ 条事实、$E$ 个非空唯一实体，向量维度 $D$，保留 $T$ 天，batch 上限 $B$，索引放大系数 $a$。先分清三种“量”：
+设每天 $W$ 个来源事件，每个抽取 $F$ 条事实、$E$ 个实体，维度 $D$、保留 $T$ 天、索引放大 $a$、batch 上限 $B$。主记录 $N\approx WFT$，存储粗估 $N\times(4D\times(1+a)+payload\_bytes)$；LLM extraction 约 $W$ 次。当前 SDK batching 只在单次 add 内：查询 `embed()` 约 $W$ 次，事实/entity 非空时各约 $W$ 次 `embed_batch()`；默认 batch 又逐条调用 `embed()`，Provider 请求可接近 $W+WF+WE$。只有跨事件 micro-batch 才近似 $W+\lceil WF/B\rceil+\lceil WE/B\rceil$。
 
-- **向量/条目数：** 主事实新增约 $WF$，保留期主记录 $N\approx WFT$；存储粗估 $N\times(4D\times(1+a)+payload\_bytes)$。每个 infer add 还产生旧记忆查询向量；entity 条目受抽取、去重和 upsert 影响，不能等同 $WE$。
-- **当前 SDK 的 Python 方法调用数：** batching 仅在单次 add 内。旧记忆查询约 `embed()` $W$ 次；事实/entity 非空时每事件各至多一次 `embed_batch()`，约 $W+W\mathbb{1}(F>0)+W\mathbb{1}(E>0)$，不是 $\lceil WF/B\rceil$。空抽取、entity 路径和逐条 fallback 均会改变它。
-- **Provider 网络请求数：** 原生 batch 时可接近上述方法调用数；默认 `EmbeddingBase.embed_batch()` 逐文本调用 `embed()`，可接近 $W+WF+WE$。空值、短返回、重试和 Provider 实现都会改变数量。
-- **事件化 micro-batch：** 仅当 worker 跨事件聚合，教学近似才是 $W+\lceil WF/B\rceil+\lceil WE/B\rceil$；第一项也会随查询/去重设计改变。extraction 通常约 $W$，合并或重放会改变它。
-- search 的语义/BM25 候选上限均为 $R=\max(4k,60)$；entity 最多 8 路、每路取 500，但只给语义候选加分。
-- **阶段延迟保守预算：** 可相加串行预算、对并行预算取较大者并留 queue 余量，但这只是 SLO 分配。端到端 p95 不是阶段 p95 的和或并行 p95 的 `max`；须由 trace/压测测量。
-
-例：$W=10^6,F=2,D=1536,T=365,a=1,payload=1KB$ 时约 7.3 亿记录、$7.3亿\times13KB\approx9.5TB$，未含副本/history。若给七阶段分别分配 5、35、45、20、70、40、10ms，225ms 只是**预算合计例**，不是推导出的端到端 p95。
+search 的语义/BM25 上限均为 $R=\max(4k,60)$；entity 最多 8 路、每路 500，且只 boost 语义候选。阶段预算可串行相加、并行取较大值并留 queue 余量，但端到端 p95 必须由 trace/压测测量，不能把各阶段 p95 直接相加。例：$W=10^6,F=2,D=1536,T=365,a=1,payload=1KB$，约 7.3 亿记录、9.5TB，未含副本/history。
 
 ### 10.5 多租户、分片与索引迁移
 
@@ -1191,7 +1169,7 @@ flowchart LR
 
 ### 11.5 离线集、在线反馈与回归测试
 
-离线集按规模、语言、类型、冲突和时间切片；回归守住 scope、阈值前置、ADD-only 与删除。线上对照收集成功、纠正和删除信号，以人工审计纠偏；组件迁移均做 shadow replay。
+离线集按规模、语言、类型、冲突和时间切片；回归守住 scope、阈值前置、ADD-only 与删除。demo 的跨用户 search 用例验证读隔离，但 ID-only mutation 必须另做授权/条件写测试。线上对照收集成功、纠正和删除信号，以人工审计纠偏；组件迁移均做 shadow replay。
 
 ### 11.6 成本和延迟护栏
 
