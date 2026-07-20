@@ -531,3 +531,369 @@ return "&".join(parts)
 2. **设计决策题：** 主向量成功、实体写失败时应返回成功、失败还是“待修复”？先定义实体是否为核心能力和重试幂等。
 3. **面试题：** 用“访问空间—发送者—协议角色—事实对象”解释 `user_id`、`actor_id`、`role`、`attributed_to`。
 4. **源码推演题：** 阅读 `_update_memory()`，列出文本变化时重算字段、actor 保留、history 与 entity cleanup 顺序及部分失败。
+
+## 6. 写入生命周期：从对话到长期记忆 {#chapter-6}
+
+### 6.1 写入前先定义不变量
+
+**直觉。** 听到“默认用 Python”时，助手不应保存寒暄或暗改旧偏好；还要区分无事实、抽取故障和各存储结果。
+
+**模型。** `消息 → scope 候选 → ADD 事实 → 主向量 → 辅助状态`。至少一个 scope；空抽取不等于 Provider 故障；多存储非原子。V3 是 **ADD-only**，不自动 UPDATE/DELETE。
+
+**候选方案。** 原文直存噪声高；LLM 决定 CRUD 含破坏性动作；只抽新增事实再显式纠错，写放大较高但边界清楚。
+
+**选择。** OSS 保留原文直存、程序摘要和默认 V3 批处理三路；下文以第三路为主。
+
+### 6.2 Memory.add 的入口校验与三条分支
+
+**数据流。** `Memory.add()` → `_build_filters_and_metadata()` → `_add_to_vector_store()`。入口处理时间字段、至少一个 scope ID 和消息列表规范化。
+
+三条分支不能互相推断：
+
+| 分支 | 处理方式 | 关键失败/返回 |
+|---|---|---|
+| `infer=False` | 跳过非法/`system` 消息，逐条 Embedding；保存正文、`role` 和可选 `actor_id` | 单条故障上抛；都是 `ADD` |
+| `agent_id` + `procedural_memory` | LLM 总结成一条程序记忆 | 故障上抛；仅此 memory type 可显式传入 |
+| 默认 `infer=True` | V3 分阶段批处理 | 单次抽取、批量降级、实体 best-effort；只有 `ADD` |
+
+`semantic_memory`/`episodic_memory` 会报错；`infer=False` 仍需要 Embedder。
+
+### 6.3 Phase 0-2：上下文、已有记忆与单次 LLM 抽取
+
+Phase 0 按键名排序拼接 scope；`user_id="u1"`、`run_id="r7"` 得到稳定 key `run_id=r7&user_id=u1`。SQLite 按 key 分区，写后只留最近 10 条，读取时恢复时间正序。
+
+Phase 1 在 scope 内语义搜索，固定 `top_k=10`。UUID 以小整数呈现给 LLM，并建反向 `uuid_mapping` 降低 ID 幻觉；后续主写未消费它。
+
+Phase 2 只做一次 JSON LLM 调用；纯 agent scope 追加 agent 视角。解析失败再 `extract_json()`；空/最终解析失败/`memory=[]` 按无事实保存消息，Provider 异常提升为 `LLMError`。
+
+### 6.4 Phase 3-6：批量 Embedding、hash 去重与持久化
+
+Phase 3 对非空 `text` 做 batch Embedding，失败则逐条回退；仍失败的事实被跳过。Phase 4 用 lemma 生成 BM25 字段（spaCy 不可用则回退原文）。
+
+Phase 5 用 `MD5(text)` 对 10 条旧候选和本批做**精确文本**去重；record 保存 UUID、正文、lemma、hash、scope、时间与归因。prompt 的 `linked_memory_ids` 未进主 payload。
+
+Phase 6 的主 insert 与 `ADD` history 都批量优先、失败逐条回退。history 和返回值基于“计划 records”而非确认成功集合，故主记录失败时仍可能写 history、返回该 ID。
+
+### 6.5 Phase 7-8：实体关联、最近消息与返回值
+
+Phase 7 批量抽取、去重并嵌入实体；先找精确匹配，再接受相似度 `≥0.95` 的匹配。整体 best-effort。
+
+V3 prompt 的 `linked_memory_ids` 表示新旧 Memory 关联，但当前主路径不持久化它；真正写入的是 NLP 重抽实体后，在**独立实体集合**保存的 Entity→Memory 引用。两者不可混称 memory graph。
+
+Phase 8 保存消息并返回计划 records；SQLite 失败上抛但不回滚先前主写。
+
+**概念伪代码（Mermaid）**
+```mermaid
+sequenceDiagram
+    participant M as Memory.add
+    participant S as SQLite
+    participant L as LLM
+    participant E as Embedder
+    participant V as 主 Vector Store
+    participant N as Entity Store
+    M->>S: 稳定 scope + 最近 10 条
+    M->>V: scope 内语义候选 top_k=10
+    M->>L: 一次 ADD-only JSON 抽取
+    alt Provider 失败
+        L--xM: 提升为 LLMError
+    else 无事实或解析失败
+        M-->>M: results=[]
+    else 有事实
+        M->>E: batch embed，失败逐条降级
+        M->>V: batch insert，失败逐条降级
+        M->>S: batch ADD history，失败逐条降级
+        M-->>N: best-effort 实体索引
+        M->>S: history + 最近消息
+        M-->>M: 返回计划 records
+    end
+```
+
+### 6.6 ADD-only 与手动 UPDATE/DELETE 并不矛盾
+
+“以前默认 Python，现在明确要求 Rust”会作为新事实 ADD。应用确认冲突后再显式 `update()`/`delete()`；自动 supersede 也应由应用保存关系，不能假设 V3 会改写旧 ID。
+
+### 6.7 部分失败、降级与一致性分析
+
+| 故障点 | 行为与后果 | 恢复 |
+|---|---|---|
+| LLM Provider / JSON 失败 | 前者 `LLMError`；后者按空抽取 | 分开告警与重试 |
+| batch Embedding | 逐条回退，仍失败则漏 record | 补偿队列 |
+| batch insert | 逐条回退；返回可能多于主存 | read-after-write |
+| history | 逐条回退；主记录可能无审计 | outbox |
+| entity | best-effort；关联增益缺失 | 重建索引 |
+| messages | SQLite 回滚上抛；主存可能成功 | 幂等对账 |
+
+这是主、派生与审计状态的最终一致性写入；history 是否为硬条件由合规策略定义。
+
+### 6.8 教学伪代码与 Mem0 源码对照
+
+**教学实现。** 改进接口只返回确认成功 ID；这不是当前结构。
+
+**教学实现**
+```python
+def persist_individually(records, insert_one) -> tuple[list[str], list[str]]:
+    persisted, failed = [], []
+    for memory_id, vector, payload in records:
+        try:
+            insert_one(memory_id, vector, payload)
+            persisted.append(memory_id)
+        except Exception:
+            failed.append(memory_id)
+    return persisted, failed
+```
+
+**Mem0 源码对照。** Provider 故障被提升；payload 只读取 `text` 和 `attributed_to`。
+
+**Mem0 源码**
+```python
+try:
+    response = self.llm.generate_response(...)
+except Exception as e:
+    raise LLMError(f"LLM extraction failed: {e}") from e
+
+mem_metadata["data"] = text
+if mem.get("attributed_to"):
+    mem_metadata["attributed_to"] = mem["attributed_to"]
+```
+
+**取舍。** 批量回退模糊全批成功；ADD-only 累积冲突；实体 best-effort 可静默降质。需补 per-record 状态、幂等与重建。
+
+### 6.9 本章练习与面试思考
+
+1. **代码阅读题：** 沿三条 add 分支列出 LLM、Embedding、主存和 SQLite 调用。
+2. **设计决策题：** 某 record insert 失败时，设计返回、补偿与幂等策略。
+3. **面试题：** 为什么解析失败的空列表仍不同于 Provider 失败？
+
+## 7. 检索生命周期：从查询到排序结果 {#chapter-7}
+
+### 7.1 查询校验、作用域与高级过滤
+
+**直觉。** 问“上次 Qdrant index size 报错怎么解决”时，语义、关键词和实体各有盲区，而且必须先限定可信 user/run scope。
+
+**模型。** 流程是 `scope → 语义候选 → 同 ID 的 BM25/实体信号 → 排序 → 可选 reranker`；候选全集由语义搜索决定。
+
+**候选方案。** 加权相加可解释；RRF 抗尺度差；LTR 有表达力但需标注；reranker-only 简单却救不回漏召回。
+
+**选择。** OSS 先语义过量召回，再按 ID 加 BM25/entity。高级 filters 的实际能力取决于 Provider。
+
+query trim 后须非空，`threshold∈[0,1]`，`top_k` 是非负非 bool 整数；三个 scope ID 至少一个且必须放 filters。
+
+### 7.2 查询预处理、Embedding 与过量召回
+
+**数据流。** 原文用于 Embedding，lemma 用于 BM25，实体用于关联增益。两路召回上限是：
+
+\[
+L_{internal}=\max(4\times top\_k,\ 60)
+\]
+
+主向量与关键词搜索都用 `internal_limit`。Provider 未覆盖 `keyword_search()` 时返回 `None`，BM25 关闭；最终 candidates 仍只来自 semantic results。
+
+评分前先过滤 `expiration_date < UTC today`（等于今天可见），再执行 `semantic_score < threshold`；BM25/entity 都救不回被剔除者。
+
+**概念伪代码（Mermaid）**
+```mermaid
+flowchart TD
+    Q[query + scope] --> V[校验]
+    V --> P[lemma + entities + query embedding]
+    P --> S[语义召回 internal_limit]
+    P --> B[BM25 召回 internal_limit]
+    P --> E[实体集合搜索]
+    S --> X{已过期?}
+    X -- 是 --> DROP[排除]
+    X -- 否 --> T{semantic_score < threshold?}
+    T -- 是 --> DROP
+    T -- 否 --> J[按 semantic ID 合并 BM25/entity]
+    B --> J
+    E --> J
+    J --> R[归一化 + top_k + explain]
+    R --> RR{可选 rerank?}
+    RR -- 成功 --> O[reranked results]
+    RR -- 失败/未启用 --> F[original results]
+```
+
+### 7.3 BM25 归一化
+
+BM25 raw 无固定上界。按 lemma term 数选择 sigmoid `(m,k)`：`≤3:(5,.7)`、`≤6:(7,.6)`、`≤9:(9,.5)`、`≤15:(10,.5)`、否则 `(12,.5)`；仅正分进入映射：
+
+\[
+bm25_{norm}=\frac{1}{1+e^{-k(raw-m)}}
+\]
+
+中点输出 0.5；这些是工程校准参数，不是概率。
+
+### 7.4 实体索引与关联记忆增益
+
+实体只取前 8 个并规范化去重，再 batch Embedding；数量错配则整路跳过。每实体并发搜索 `top_k=500`，相似度 `<0.5` 忽略。
+
+实体记录含一组 `linked_memory_ids`。对每个命中的实体，设链接数为 \(n\)，稀释权重和 boost 为：
+
+\[
+w(n)=\frac{1}{1+0.001(n-1)^2},\qquad
+entity\_boost=similarity\times 0.5\times w(n)
+\]
+
+同一 Memory 多次命中取最大 boost。`n=1` 权重为 1，`n=101` 约为 `1/11`，可抑制高连接实体。
+
+### 7.5 融合公式、阈值和候选池限制
+
+设某个语义候选为 \(d\)，当前精确公式是：
+
+\[
+raw(d)=semantic(d)+normalized\_bm25(d)+entity\_boost(d)
+\]
+
+\[
+max\_possible=1.0+\mathbb{1}_{BM25\ active}\times1.0+\mathbb{1}_{entity\ active}\times0.5
+\]
+
+\[
+final(d)=\min\left(\frac{raw(d)}{max\_possible},1.0\right)
+\]
+
+“active”指整次查询的 score dict 非空。数值例：4-term query 得 `(m,k)=(7,.6)`；A 的 semantic=`.72`、raw BM25=`9`，规范后 `.769`；实体 similarity=`.8`、`n=1`，boost=`.4`。两路 active，分母 `2.5`：
+
+\[
+final_A=(0.72+0.769+0.4)/2.5\approx0.756
+\]
+
+若 threshold=`.75`，A 在相加**前**因 `.72 < .75` 被排除：语义候选/阈值先于 BM25/实体融合。
+
+**教学实现。** 这个可运行函数只复现评分门控，不实现 Provider 搜索。
+
+**教学实现**
+```python
+def hybrid_score(semantic, bm25, entity, threshold):
+    if semantic < threshold:
+        return None
+    raw = semantic + (bm25 or 0.0) + (entity or 0.0)
+    maximum = 1.0 + (1.0 if bm25 is not None else 0.0)
+    maximum += 0.5 if entity is not None else 0.0
+    return min(raw / maximum, 1.0)
+assert round(hybrid_score(0.72, 0.769, 0.4, 0.1), 3) == 0.756
+```
+
+### 7.6 explain 与可选 reranker
+
+**Mem0 源码对照。** `explain=True` 公开 semantic/BM25/entity、raw、上界、final 和 threshold。融合截断后才可选 rerank；失败 warning 并回退原结果。
+
+**Mem0 源码**
+```python
+semantic_score = result.get("score") or 0.0
+if semantic_score < threshold:
+    continue
+raw_combined = semantic_score + bm25_score + entity_boost
+combined = min(raw_combined / max_possible, 1.0)
+```
+
+reranker 只接收融合后的 top_k，无法找回候选、过期或 threshold 阶段丢掉的记录。
+
+### 7.7 真正多路召回与当前实现的对照
+
+| 方案 | 候选 | 优点 | 取舍 |
+|---|---|---|---|
+| 当前加权相加 | 仅语义 | 快、可解释 | 精确词不能独立召回 |
+| RRF | 多路并集 | 抗分数量纲 | 丢分差、需调常数 |
+| Learning-to-rank | 多路并集 | 学习任务权重 | 需标注与漂移治理 |
+| reranker-only | 前置单路 | 统一精排 | 漏召回不可恢复、成本高 |
+
+真正多路召回应取三路 ID 并集；当前 BM25/entity 只给 semantic IDs 加分。
+
+**取舍。** 加法易解释但需校准；阈值前置会误杀词法强结果。应分开评估候选、阈值、信号与 reranker。
+
+### 7.8 本章练习与面试思考
+
+1. **代码阅读题：** 沿 `_search_vector_store()` 标出过期过滤、语义阈值、BM25/entity 合并和 top-k 截断的精确顺序。
+2. **设计决策题：** 错误码漏召回时，比较降 threshold、BM25 并集与 reranker。
+3. **面试题：** 为什么 reranker 不是召回器？explain 如何支持治理？
+
+## 8. 更新、遗忘、过期和历史 {#chapter-8}
+
+### 8.1 新事实、冲突事实与显式更新
+
+**直觉。** “默认 Python”变成“只用 Rust”既可是新事件，也可是纠错；覆盖会丢变化，追加会保留冲突。
+
+**模型。** 教学状态为 Active、Superseded、Expired、Deleted。OSS 没有 superseded/deleted 主 payload flag：前者属应用关系，expired 由日期推导，delete 物理删除主向量而 history 可留痕。
+
+**候选方案。** 追加保留事件，update 保持 ID，supersede 关系最清楚但需额外 schema 与过滤。
+
+**选择。** V3 自动 ADD；确认后才显式 update/delete。当前配置应以配置库为准，演变史则追加并由应用记录 supersedes。
+
+### 8.2 update 的重算范围
+
+**数据流。** update 至少给 text、metadata 或 expiration；`data` 旧别名会 warning。缺 ID 报 `ValueError`，底层 get 故障原样上抛。
+
+payload 合并旧值与 metadata，重算向量、MD5 hash、lemma，保留 `created_at`、刷新 `updated_at`。仅更新 metadata 也重算正文向量；已有 `actor_id` 强制保留，调用者不能覆盖。
+
+主更新后写 `UPDATE` history。正文变化才清理旧实体引用并重建；实体异常 best-effort，主存/history 异常上抛。顺序是主存→history→entity，无跨存储回滚。
+
+**教学实现。** 显式确认纠错：
+
+**教学实现**
+```python
+def confirm_correction(memory, old_id: str, new_text: str) -> None:
+    memory.update(old_id, text=new_text)
+```
+
+### 8.3 delete、delete_all 与 reset
+
+`delete(id)` 依次删除主向量、写 `DELETE` history（`new_memory=None, is_deleted=1`）、best-effort 清实体引用；history 失败时主向量已删，无法回滚。
+
+`delete_all()` 要 scope 且逐条删除，可能部分完成；无 scope 应用 `reset()`，它清 SQLite、重建主集合并重置 entity store，是全局操作。
+
+### 8.4 expiration_date 与查询时过滤
+
+OSS 的 `expiration_date` 只有日期粒度：add 规范 `date`/`datetime`/`YYYY-MM-DD`，update 可设置或以 `None` 清除。search/get_all 默认隐藏早于 UTC today 的记录，`show_expired=True` 可见；等于今天未过期。
+
+Expired 仅是查询时过滤，不物理删除向量、history/entity，也无后台 TTL。隐私擦除需另建清理作业覆盖派生副本与备份。
+
+### 8.5 历史审计与物理删除的冲突
+
+history 保存 ADD/UPDATE/DELETE 的 old/new；主向量删除后仍可读 DELETE 轨迹，所以删主存不等于删尽正文。
+
+GDPR 风格擦除与审计保留是政策选择：需定义正文、最小审计元数据、实体、日志和备份期限。Mem0 不保证法规意义的全面擦除或不可变审计，`delete()`/history 不能当合规认证。
+
+### 8.6 OSS 与 Platform 时间能力边界
+
+**Mem0 源码对照。** OSS 拒绝 add 的 `timestamp`、search 的 `reference_date`，`project.update(decay=True)` 也报 Platform 能力提示；只支持 date-only `expiration_date` 过滤。不能宣称 OSS 有 temporal reasoning、reference-date search 或 decay，也不能从此反推 Platform 内部。
+
+**Mem0 源码**
+```python
+if timestamp is not None:
+    raise ValueError(get_temporal_feature_error_message("sync", "add", "timestamp"))
+if reference_date is not None:
+    raise ValueError(get_temporal_feature_error_message("sync", "search", "reference_date"))
+```
+
+### 8.7 生命周期状态图
+
+**概念伪代码（Mermaid）**
+```mermaid
+stateDiagram-v2
+    [*] --> Active: ADD 主记录
+    Active --> Active: 显式 update 同一 ID
+    Active --> Superseded: 应用确认新事实取代旧事实
+    Active --> Expired: expiration_date 早于 UTC today
+    Expired --> Active: update 清除/延后日期
+    Active --> Deleted: delete / scoped delete_all
+    Deleted --> [*]
+    note right of Superseded
+      教学概念 / 应用层关系
+      OSS 无显式 storage flag
+    end note
+    note right of Expired
+      日期推导 / 仍物理存在
+    end note
+    note right of Deleted
+      主向量删除 / history 可留痕
+    end note
+```
+
+四者是**教学概念**，不是当前枚举/同表 flags；仅 history 行有 `is_deleted` 删除事件标记。
+
+**取舍。** update 简化查询但隐藏演变；supersede 保留证据但需过滤；过期可预测但不擦除。删除与审计的平衡来自数据政策。
+
+### 8.8 本章练习与面试思考
+
+1. **代码阅读题：** 追踪 update 的主存、history、entity 顺序及回滚边界。
+2. **源码推演题：** 一条昨天过期的记录分别调用 `get()`、`search(show_expired=False)`、`search(show_expired=True)`，根据源码判断可见性差异。
+3. **面试题：** `delete_all()` 与 `reset()` 为何分开？ADD-only 与 supersede 如何处理冲突？
