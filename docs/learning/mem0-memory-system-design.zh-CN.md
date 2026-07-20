@@ -1089,3 +1089,335 @@ memory = Memory.from_config(config)
 2. **实现题：** 增加 `idempotency_key`，写出并发 add 的不变量。
 3. **设计决策题：** 合并 semantic/BM25 候选，并处理主存成功、history 失败。
 4. **面试题：** 为何确定性 embedder 不能证明语义能力？如何用 Recall@k、MRR 评测？
+
+## 10. 工程化与生产设计 {#chapter-10}
+
+### 10.1 幂等、并发与重复写入
+
+生产不变量是“同一来源事件、抽取版本和作用域至多产生一组逻辑事实”，而非“相同文本只存一次”。以规范化的 `tenant_id + user/agent/run scope + source_event_id + extractor_version` 生成 `idempotency_key`；事实再附 `fact_ordinal` 或稳定 fact key，并建唯一约束。文本 hash 只做组内去重：它既不识别同义改写，也可能误合并审计意义不同的同文事件。
+
+消费者以 key 领取 `PENDING` 租约，提交时靠唯一约束/CAS 改为 `COMMITTED`；超时接管者复用 logical memory ID。显式 `update()` 带版本/ETag 防覆盖。当前文本 MD5 与候选检索无跨进程唯一约束，只能降低重复概率。
+
+### 10.2 原子性、补偿与最终一致性
+
+先定义主记忆是否为真相源、history 是否强制、entity 是否可重建。当前是多存储 best-effort；只有应用补上幂等重试、补偿、read-after-write 与对账后，才是会收敛的 eventual consistency。
+
+| 故障点 | 当前行为 | 用户可见效果 | 一致性风险 | 重试安全性 | 更强生产方案 |
+|---|---|---|---|---|---|
+| LLM 限流/超时；非法 JSON | Provider 异常提升为 `LLMError`；最终解析失败按空抽取并保存消息 | 前者失败，后者像“无事实” | 漏记且两类故障可能监控不足 | 重调 LLM 可能得到不同事实 | 区分 `NO_FACT`/`PARSE_ERROR`，保存原事件，以 idempotency key 重放并校验 schema |
+| batch Embedding | 整批异常逐条回退；短返回会被 `zip` 截断 | 返回记录数减少 | 同批事实不完整 | 无唯一键时重试可能重复成功项 | 记录逐项状态、限定退避与 DLQ，按 logical ID upsert |
+| 主 vector insert | batch 失败后逐条；单条失败只记日志，后续仍按计划 records 写 history/entity/返回 | API 可能返回实际不可检索 ID | orphan history、dangling entity | 仅凭随机 ID/MD5 不安全 | 权威表事务 + outbox；索引按固定 ID upsert，确认后才返回 |
+| history insert | batch 失败后逐条；失败不回滚主记忆 | 记忆可搜但历史缺口 | 审计不完整 | 随机 history ID 重放会重复 | 与权威记录同事务写不可变事件，或唯一 operation ID + 对账 |
+| entity insert/update | warning 后继续，主记忆仍成功 | 实体增强降质 | 缺链接、重复实体或 dangling link | 集合 union 有一定幂等性，但并发读改写不安全 | 把 entity 定义为派生索引，版本化重建；CAS/upsert 与孤儿扫描 |
+| reranker | 捕获异常并回退融合结果 | 排序质量下降、仍有结果 | 无持久一致性风险 | 查询重试安全 | 熔断、超时、fallback 指标；保留融合分与 rerank 版本便于回放 |
+
+主写失败要阻止辅助索引确认；合规 history 失败使整体保持 `PENDING`；entity 失败可返回 `DEGRADED` 后重建。删除须分页到空并覆盖实体、history 政策、日志和备份，不能依赖单页 `delete_all()` 或 lazy entity 未初始化时的 `reset()`。
+
+### 10.3 批处理、重试、降级和背压
+
+批量使成功变成逐项状态。只重试超时、429、可恢复 5xx，指数退避加 jitter 和总时限；schema/维度错入 DLQ。以 tenant 配额、积压数和 token budget 背压，高水位暂停低价值抽取但保留原事件。检索可依次降级 reranker→entity→BM25→semantic，scope 授权、过期与安全检查不可降级。
+
+### 10.4 成本、延迟与容量规划
+
+设每天来源事件 $W$，每事件平均抽取 $F$ 条事实、$E$ 个实体，向量维度 $D$，保留 $T$ 天，batch 上限 $B$，索引放大系数 $a$：
+
+- 主记录数 $N=WFT$；向量与索引粗估 $N\times(4D\times(1+a)+payload\_bytes)$。
+- infer 写入的 extraction 调用约为 $W$；Embedding 请求约为 $W+\lceil WF/B\rceil+\lceil WE/B\rceil$，第一项是旧记忆查询向量，逐条 fallback 会增加调用。
+- search 的语义/BM25 候选上限均为 $R=\max(4k,60)$；entity 最多 8 路、每路取 500，但只给语义候选加分。
+- 串行关键路径粗估 $p95\approx L_{pre}+L_{embed}+L_{semantic}+L_{bm25}+L_{entity}+L_{rerank}+L_{queue}$；并行项取 `max`，另计排队。
+
+例：$W=10^6,F=2,D=1536,T=365,a=1,payload=1KB$ 时约 7.3 亿记录、$7.3亿\times13KB\approx9.5TB$，未含副本/history。各段 p95 为 5、35、45、20、70、40、10ms 时串行约 225ms；须按租户实测，不能用均值冒充 p95。
+
+### 10.5 多租户、分片与索引迁移
+
+tenant 来自认证主体，scope 只能收窄。小租户共享集合并复合过滤；大租户独立 shard，热点组织再按 user hash 拆分。配额覆盖 QPS、事实数、token、候选和 entity fan-out。
+
+Embedding 维度、距离度量或 schema 变化时建 `index_v2`：从权威事件回填，双写固定 logical ID，shadow read 比较 Recall/延迟，达标后切读，再停止旧写并延迟清理。不要原地混写不同维度；迁移对账应比较期望 ID 集与实际 ID 集。
+
+### 10.6 隐私、安全与可观测性
+
+密钥由 secret manager/环境注入，进程只读；日志只记 provider、错误类和脱敏 request ID，不打印环境值、prompt 或配置 dump。内容需分类、最小保留、加密和细粒度授权；召回文本按不可信输入处理。观测阶段状态、空抽取/解析错、orphan/dangling、scope 拒绝、质量、分位延迟、token 和单位成功成本，并以 idempotency key 串 trace。
+
+### 10.7 同步 SDK、异步 SDK 与服务化
+
+| 形态 | 优点 | 主要代价 | 适用 |
+|---|---|---|---|
+| 本地同步/异步 SDK | 依赖透明、少一跳；async 便于等待 I/O | 每应用持密钥、版本漂移；async 仍可能 `to_thread` | 单团队、低规模、强定制 |
+| 共享 memory service | 集中鉴权、配额、schema 与观测，多语言复用 | 网络延迟、服务成为共享故障域 | 多应用/多团队在线读写 |
+| 事件驱动 pipeline | 可削峰、重放、补偿与独立扩缩 | 写后有新鲜度窗口，运维复杂 | 高吞吐、允许异步记忆 |
+
+**概念伪代码（Mermaid）**
+```mermaid
+flowchart LR
+    A[Agent/API] --> G[鉴权与幂等入口]
+    G --> Q[(Event Log/Outbox)]
+    Q --> X[抽取与 Embedding Worker]
+    X --> S[(权威状态)]
+    S --> V[(Vector/Entity 派生索引)]
+    C[对账与重建] --> S
+    C --> V
+    A --> R[Online Recall Service]
+    R --> V
+```
+
+### 10.8 本章练习与面试思考
+
+1. 为“同一 webhook 被投递三次”写出 key、状态机、唯一约束和重放策略。
+2. 任选 history 或 entity 作为硬/软依赖，说明返回码、补偿与 SLO 的变化。
+3. 用实际 QPS、F、D、T 重算容量和成本，找出最敏感参数。
+
+**取舍。** 本地 SDK 最简单，服务化便于治理，事件流最利于恢复；复杂度必须由故障预算和规模证明，而非提前堆组件。
+
+## 11. 如何评估记忆系统 {#chapter-11}
+
+### 11.1 写入质量：准确、遗漏、误记、归属与去重
+
+标注集从原消息给出 gold 事实、应忽略内容、scope/attribution、冲突和期限。写入 precision=`正确抽取/全部抽取`，recall=`正确抽取/gold 应抽取`；另测无依据误记、归属准确率、误合并与漏合并。单列 Provider 失败和合法无事实，避免空列表美化 precision。
+
+### 11.2 检索质量：Recall、MRR 与 NDCG
+
+对查询 $q$，`Precision@k=top-k 中相关数/k`，`Recall@k=top-k 中相关数/全部相关数`；$MRR=\frac1{|Q|}\sum_q1/rank_q$。分级相关性用 $DCG@k=\sum_{i=1}^k(2^{rel_i}-1)/\log_2(i+1)$，`NDCG=DCG/IDCG`。
+
+例：gold `{A,C,D}`，返回 `[A,B,C]`，P@3=R@3=2/3，首个相关排第 1，RR=1。相关等级 `[3,0,2]`、理想 `[3,2,0]` 时，DCG=8.5、IDCG≈8.893、NDCG≈0.956。候选 Recall、融合和 reranker NDCG 要分层测。
+
+### 11.3 时间一致性、冲突率与陈旧度
+
+定义 current fact accuracy、active 冲突率和 `staleness=应更新到正确召回的时长`。测试“曾用 Redis”“现用 pgvector”“计划迁移”；这是应用评测，不代表 OSS 支持 `timestamp`、`reference_date`、完整 temporal reasoning 或 decay。OSS 只有 UTC 日期粒度 expiration。
+
+### 11.4 端到端任务收益
+
+组件指标回答“抽得准、找得到”，业务指标回答“任务是否更好”。测任务成功、偏好遵循、修复轮数；绝对 lift=`success_with_memory-success_without_memory`，相对 lift 再除 baseline。还须报告隐私错误和负迁移，Recall 上升不能替代任务收益。
+
+### 11.5 离线集、在线反馈与回归测试
+
+离线集按规模、语言、类型、冲突和时间切片；回归样例守住 scope、阈值前置、ADD-only 与删除。线上对照实验收集成功、纠正和删除信号，并以人工审计纠偏。extractor/embedder/index 迁移均做 shadow replay。
+
+### 11.6 成本和延迟护栏
+
+护栏至少是 write/search p95、timeout/降级率、每千事件 extraction/embedding token 或请求成本、每成功任务总成本，以及队列 age。用质量—延迟—成本 Pareto 面选版本；任何提升若伴随跨租户错误或删除失败，均不得上线。
+
+### 11.7 本章练习与面试思考
+
+1. 为“默认 Python”构造正确抽取、误归属、同义重复、冲突和陈旧五类样例。
+2. 设计 ablation：semantic only、+BM25、+entity、+reranker，并分别报告候选 Recall 与 NDCG。
+3. 解释为何在线点赞率不能独立证明记忆有效。
+
+**取舍。** 离线评测可复现但有分布差，在线实验真实却有风险；两者必须用回归门禁、灰度和隐私护栏闭环。
+
+## 12. 设计复盘与适用边界 {#chapter-12}
+
+### 12.1 Mem0 当前设计的主要优点
+
+Provider 抽象使组件可替换；scope、事实、history、recent messages 和 entity 分工明确；批量与可选增强保持最小路径，`explain` 支持治理。但统一接口不会自动统一 Provider 能力和多存储语义。
+
+### 12.2 ADD-only 的收益与代价
+
+自动推断只 ADD，减少模型误删改；显式 update/delete 仍可纠错。代价是冲突、陈旧和增长，应用需 evidence、validity、supersedes 与确认。异常单轮不能覆盖稳定偏好：要求多次证据、显式确认或 Profile 优先。
+
+### 12.3 混合评分与实体增强的边界
+
+BM25/entity 改善排序，但 threshold 在融合前，且只 boost semantic candidates；reranker 也救不回漏候选。entity store 是 best-effort 派生索引。精确召回若是硬需求，须多路候选并集与重建。
+
+### 12.4 什么时候不该使用长期记忆系统
+
+固定设置用 Profile/关系库，重放用 event log，稳定文档用 RAG，请求内状态用 context/cache，强事务配置用业务主库。无跨请求收益、无用户同意、错误伤害更高或无法删除/评测时，不应引入长期记忆。
+
+### 12.5 可演进方向
+
+可从权威事件 + outbox、稳定 logical ID、版本/CAS 开始，再做多路候选并集、校准/LTR、冲突与 supersede、索引重建、租户配额和法规删除编排。时间能力应以明确事件时间/有效区间模型实现；不要把 OSS 当前 `expiration_date` 推演成已有 temporal/decay 能力。
+
+**取舍与练习。** 选一个真实场景，先证明 Profile、event log 或 RAG 不足，再写出引入记忆的增量收益、最坏错误、删除路径和下线条件。
+
+## 13. 系统设计面试题与参考分析 {#chapter-13}
+
+以下每题都应从需求和不变量出发，再连到数据、写入、检索、一致性、规模、安全与评测；“参考分析”是论证骨架，不是唯一答案。
+
+### 13.1 概念题
+
+#### 问题1：向量数据库与记忆系统有什么区别？
+
+**参考分析：** 先澄清是相似检索还是跨请求个性化。向量库提供过滤和近邻候选；记忆系统还负责选择、原子化、scope、冲突、历史与遗忘。以事件为证据、向量为派生索引，用写入质量、Recall、任务 lift 和删除覆盖验收。
+
+#### 问题2：如何为工作、语义、情景和程序记忆建模？
+
+**参考分析：** 先问使用者、寿命和是否重放；类型不替代 owner。事件、事实、步骤可共享 logical ID/scope，但用不同 TTL 和召回；规模化可分层存储，按最敏感来源授权，评测按类型切片。
+
+#### 问题3：为什么抽取原子事实，而不直接保存全部对话？
+
+**参考分析：** 原子事实省 token、利于去重与召回，却会丢语气/证据。保留 source_event_id，写入校验归因，检索可回指原文；高风险事实需确认，以抽取 precision/recall 和任务收益权衡损失。
+
+#### 问题4：怎样防止一次异常对话覆盖长期偏好？
+
+**参考分析：** 区分临时要求、纠错和稳定偏好；单一低置信事件不能破坏确认状态。模型保留 evidence、confidence、validity、supersedes 和版本，默认 ADD-only；多次证据或用户确认后才 CAS 更新 Profile，并测冲突/误覆盖。
+
+#### 问题5：如何表达“过去、现在、未来”的事实？
+
+**参考分析：** 区分 event/ingest time、valid interval 和计划状态，查询给 reference time 并定义冲突选择。事件日志保存演变、当前视图可重建，删除覆盖两者。OSS 仅有日期 expiration，不能宣称已有完整 temporal/reference-date/decay。
+
+#### 问题6：如何同时评估记忆写入和检索？
+
+**参考分析：** 写入测 precision/recall、误记、归属和去重；检索分候选 Recall、MRR/NDCG、threshold 与 reranker。再用无记忆对照测任务成功/lift，把成本、p95、跨租户错误和删除失败设为护栏。
+
+### 13.2 源码阅读题
+
+#### 问题7：解释当前 `Memory.add()` 的 V3 阶段与返回风险。
+
+**参考分析：** 沿最近消息、旧候选、LLM、batch Embedding、hash、主写、history、entity 和 messages 画图。自动路径 ADD-only；主写失败仍可能按计划写辅助状态并返回 ID。生产应确认 persisted IDs，再用 outbox 补偿。
+
+#### 问题8：为什么高 BM25 分不能救回低语义分结果？
+
+**参考分析：** 候选只来自 semantic results，`score_and_rank()` 先做 semantic threshold，BM25/entity 仅按同 ID 加分。先测候选 Recall；专名若是硬需求，改多路 ID 并集/RRF，而非只调 reranker。
+
+#### 问题9：`SQLiteManager` 与主 Vector Store 的一致性是什么？
+
+**参考分析：** SQLite 单次 batch 有事务，但与主向量无共享事务；history/messages 也分调用。先定 history 是否硬条件，再选权威库 + outbox 或 `PENDING`；用 orphan/missing-history 对账和 operation ID 幂等修复。
+
+#### 问题10：`delete_all()` 与 `reset()` 有哪些源码边界？
+
+**参考分析：** scoped delete_all 只 list 一页，Qdrant 默认可能最多 100；reset 是无 scope 破坏入口。两者都受 lazy entity 是否初始化影响。生产须分页到空、计数验证、清 entity/history/备份并审计授权。
+
+#### 问题11：lazy entity store 如何造成更新或删除残留？
+
+**参考分析：** `_entity_store is None` 时 cleanup 直接返回，即使底层旧集合存在；后来初始化也不补清旧引用。entity 应是可重建索引，以 scope 扫 dangling links；强一致需求改用关系表和事务/outbox。
+
+#### 问题12：同步、异步 `Memory` 与共享服务如何选？
+
+**参考分析：** sync 适合简单调用；async 可并发等待，但 `to_thread` 不等于原生非阻塞或事务。多语言/租户治理宜服务化，高写量可事件化。比较网络 p95、密钥、升级、背压与故障域后再选。
+
+### 13.3 故障分析题
+
+#### 问题13：LLM 抽取非法 JSON、429 或超时时如何制定失败策略？
+
+**参考分析：** 把合法无事实、解析错和 Provider 不可用分开；当前前两者可返回空，后者为 `LLMError`。保存 source event，以 extractor version 幂等重放；限流退避，schema 错入 DLQ，高风险事实人工复核。
+
+#### 问题14：batch Embedding 部分失败怎么办？
+
+**参考分析：** 当前整批异常逐条降级，仍失败的事实被跳过。生产记录每 fact 状态和固定 ID，限制重试/并发，维度错直接隔离；返回逐项结果，按成功事实计费并监控漏记率。
+
+#### 问题15：主向量成功、history 失败时返回什么？
+
+**参考分析：** 先决定审计是否合规不变量。若是，保持 PENDING 并由事务 outbox 补齐；否则返回 degraded + operation ID。唯一事件键防重，后台对账主/history ID，SLO 分开报告可搜与可审计时间。
+
+#### 问题16：实体索引失败但主记忆成功，应否回滚？
+
+**参考分析：** entity 只做排序增强时不回滚主事实，返回 degraded 并排队重建；授权必须在主 scope 层。用 coverage、dangling link 和召回增益评估其写放大。
+
+#### 问题17：reranker 超时如何保证服务质量？
+
+**参考分析：** 设短超时、熔断和并发上限，保留融合排序 fallback；当前源码也是异常回退。记录版本、降级率和 NDCG/任务收益，覆盖 p95 与成本才启用；它不能补漏候选。
+
+#### 问题18：被遗忘权与审计保留冲突时如何设计？
+
+**参考分析：** 政策先明确可删正文、最小审计字段、期限和 legal hold。deletion job 遍历主记录、entity、history、日志与备份，分页幂等重试并 read-after-delete，产出无正文证明。`delete()` 不是合规承诺。
+
+### 13.4 百万用户扩展题
+
+#### 问题19：百万用户如何做隔离与分片？
+
+**参考分析：** tenant 来自认证，scope 只收窄；共享集合做复合过滤和 tenant hash，大租户独立 shard。路由版本化，禁止跨 shard 无界查询，配额限制 QPS/token/entity fan-out；隔离回归是发布门禁。
+
+#### 问题20：热点组织和长尾租户如何共存？
+
+**参考分析：** 测租户事实数、QPS 和 fan-out。长尾共享池，热点按 user hash 拆并配独立队列；公平调度防 noisy neighbor。搬迁用双写/shadow read，测热点 p99 与长尾饥饿率。
+
+#### 问题21：如何做容量与成本估算？
+
+**参考分析：** 由 W、F、D、T 和索引/副本放大推导记录与 TB，再算 extraction、Embedding、entity 和候选调用。以真实分布做敏感性分析，设租户预算/TTL；按每成功任务成本决策。
+
+#### 问题22：写入洪峰如何背压又不丢信息？
+
+**参考分析：** 原事件先入 durable log，以 tenant 配额和 queue age 背压；分阶段批处理。低价值记忆可延迟，授权/删除事件不可丢；idempotency key 支持重放，DLQ 收永久错误，并测新鲜度与恢复时间。
+
+#### 问题23：如何迁移 Embedding 模型和索引维度？
+
+**参考分析：** 建 v2 而非原地混维度，从权威事件回填，以 logical ID 双写。shadow query 比 Recall/NDCG、p95 和成本，按租户切读并保留回滚；对账数量、hash、scope 后再清 v1。
+
+#### 问题24：多地域部署采用什么一致性？
+
+**参考分析：** 先问驻留、home region 和陈旧度。事件在主区排序，索引异步复制；读可粘主区或带 freshness token。冲突用版本/事件序，删除优先传播；测跨区 staleness、RPO/RTO 和误归属。
+
+### 13.5 完整系统设计题
+
+#### 问题25：设计一个带长期记忆的 AI 编程助手。
+
+**参考分析：** 澄清偏好、项目事实、故障与步骤的 owner/寿命；Profile 存确认偏好，event log 存证据，索引存派生事实。写入幂等、ADD-only 后确认冲突；检索 scope + 多路候选；以任务成功、p95、成本和删除覆盖验收。
+
+#### 问题26：设计可纠错的用户偏好系统。
+
+**参考分析：** 异常单轮不得覆盖确认偏好，变化须可追溯。模型含 evidence、confidence、valid interval、version；写入追加候选，确认后 CAS 更新 Profile，检索以 Profile 优先。评测误覆盖、确认负担、陈旧度和删除完成率。
+
+#### 问题27：设计“故障经历与解决步骤”记忆。
+
+**参考分析：** 分存 incident event、情景摘要和 procedure，关联组件/版本/错误码。写入脱敏 secret，检索走错误码 BM25 并集 + 语义/entity；用版本和 supersede 过期旧修复。测首次解决率与错误建议率。
+
+#### 问题28：设计供 Python、TypeScript 和编辑器插件共享的记忆服务。
+
+**参考分析：** 统一 API schema、认证 tenant 和 operation ID，客户端只传授权 scope。服务端 outbox 驱动索引，读提供 freshness/explain；治理 SDK 兼容、租户配额和区域路由。契约测试覆盖多语言，SLO 覆盖可用性/一致性。
+
+#### 问题29：设计隐私优先的企业记忆平台。
+
+**参考分析：** 先定数据分类、同意、驻留、期限和 legal hold；最小抽取，密钥安全注入，正文加密且召回不可信。删除覆盖所有副本并留最小证明；权限 canary、泄漏红队、删除时延和审计完整率是硬指标。
+
+#### 问题30：设计记忆系统的评测与上线方案。
+
+**参考分析：** 版本化离线集覆盖类型、scope、冲突、时间和删除；逐层测 extraction、candidate Recall、MRR/NDCG、reranker，再对照测任务 lift。shadow→小租户→灰度，设成本/p95/隐私 guardrail 与回滚，保存版本/trace。
+
+### 13.6 回答框架与自检清单
+
+九步回答：①需求/QPS/合规；②scope、证据、删除不变量；③事件、视图、事实、entity、history；④幂等写；⑤过滤、候选、融合、rerank；⑥事务、补偿、重放；⑦容量、分片、背压；⑧鉴权、密钥、擦除；⑨组件指标、任务 lift 和护栏。自检是否把向量库当系统、best-effort 当最终一致、ADD-only 当无显式 CRUD，或夸大 OSS 时间能力。
+
+## 14. 附录 {#chapter-14}
+
+### 14.1 核心源码地图
+
+| 文件 | 打开时要回答的问题 |
+|---|---|
+| `docs/learning/mem0-memory-system-design.zh-CN.md` | 结论与源码边界一致吗？ |
+| `examples/memory_system_design_demo.py` | V0–V4 简化了什么？ |
+| `tests/examples/test_memory_system_design_demo.py` | 教学不变量是什么？ |
+| `mem0/memory/main.py` | add/search/CRUD 顺序、降级、lazy entity 如何？ |
+| `mem0/memory/storage.py` | SQLite 事务与最近 10 条如何？ |
+| `mem0/configs/enums.py`、`mem0/configs/base.py` | 类型、结果和 Provider 配置如何表达？ |
+| `mem0/configs/prompts.py` | 抽取 schema 哪些字段未持久化？ |
+| `mem0/utils/factory.py` | 工厂统一和未统一什么？ |
+| `mem0/utils/scoring.py` | 门控、归一化、融合、explain 如何？ |
+| `mem0/utils/entity_extraction.py`、`mem0/utils/lemmatization.py` | entity/关键词如何生成与降级？ |
+| `mem0/vector_stores/base.py` | 方法、分数、batch/keyword 默认值是什么？ |
+| `mem0/llms/base.py`、`mem0/embeddings/base.py` | 接口与 batch fallback 是什么？ |
+| `tests/test_memory.py` | reset、时间、metadata、delete_all 边界是什么？ |
+| `tests/memory/test_main.py` | LLMError 与 entity 并发如何验证？ |
+| `tests/utils/test_scoring.py` | 语义门控和加法预期是什么？ |
+| `docs/open-source/overview.mdx`、`docs/open-source/configuration.mdx` | Library/Server 配置与密钥边界是什么？ |
+
+### 14.2 术语表
+
+| 术语 | 本文含义 |
+|---|---|
+| memory type | 按语义、情景、程序等功能分类；不等于当前 API 对称支持 |
+| scope | user/agent/run 限定的访问与复用空间 |
+| actor | 原消息参与者；不替代 scope/授权 |
+| atomic fact | 可独立归因、去重、召回与纠错的最小事实 |
+| ADD-only | 自动抽取只新增；显式 update/delete 仍存在 |
+| semantic search | 用 Embedding 相似度形成当前主候选 |
+| BM25 | 词法相关信号；当前只 boost 语义候选 |
+| entity boost | 实体命中经链接数稀释后的加分 |
+| reranker | 对已有 top-k 精排，不能恢复漏候选 |
+| TTL | 到期硬隐藏/删除策略；OSS expiration 是 UTC 日期过滤 |
+| decay | 随时间降权；不能宣称当前 OSS 已支持 |
+| idempotency | 同一逻辑操作重复执行不新增副作用 |
+| compensation | 多存储部分失败后的可重试修复动作 |
+| MRR | 每查询首个相关结果倒数排名的均值 |
+| NDCG | 考虑位置折损与分级相关性的归一化排序指标 |
+
+### 14.3 推荐阅读顺序
+
+设计者按 2→3→5→10→11→12；实现者按 4→6→7→8→9 后沿源码地图验证；面试先掌握 13.6，再限时回答并量化。Hosted Platform 能力另查公开文档，不能从 OSS 反推。
+
+### 14.4 进一步实验
+
+1. 给教学引擎增加 source event + extractor version 幂等键，并用并发测试证明只产生一个 logical ID。
+2. 把语义候选与关键词候选改为并集，比较 Recall@k、NDCG、延迟和成本。
+3. 注入各写入点/reranker 故障，验证补偿和对账。
+4. 生成冲突与过去/现在/未来数据集；只在应用层实现有效区间，不冒充 OSS temporal 能力。
+5. 模拟多档租户规模，估算热点、存储与 p95。
+6. 实现分页删除、entity 残留扫描和 deletion receipt。
