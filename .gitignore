@@ -187,7 +187,7 @@ notebooks/*.yaml
 # local directories for testing
 eval/
 qdrant_storage/
+.worktrees/
 .crossnote
 testing.ipynb
 .weave/
-
